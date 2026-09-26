@@ -1,0 +1,46 @@
+# --- Données -------------------------------------------------------------------
+# Les données sont volumineuses (plusieurs dizaines de Go) et se régénèrent avec
+# download_binance.py : on ne les versionne pas.
+data/*
+# ... sauf le registre des trous longs : petit, et il contient les raisons saisies à la main.
+!data/known_gaps.csv
+*.parquet
+*.zip
+*.tmp
+
+# --- Environnement Python -----------------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# --- Tests ---------------------------------------------------------------------
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- MLflow (serveur local) ----------------------------------------------------
+mlruns/
+mlartifacts/
+mlflow.db
+
+# --- Notebooks -----------------------------------------------------------------
+.ipynb_checkpoints/
+
+# --- Secrets -------------------------------------------------------------------
+# Clés API Binance et autres identifiants : ne JAMAIS les pousser sur GitHub.
+.env
+.env.*
+*.key
+secrets*
+
+# --- Éditeurs et système -------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
