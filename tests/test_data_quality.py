@@ -43,8 +43,8 @@ les tests par étiquette, `-k` par nom de test ou de fichier. Les deux se combin
     volumes         volumes positifs, volume acheteur <= total,           après un (re)téléchargement de fichiers
                     trades => volume, VWAP entre low et high
     registre        known_gaps.csv bien formé (aussi dans completude)     après avoir édité known_gaps.csv à la main
-    verification    bougies 1 s du perpétuel agrégées en 1 min =          après une modification de la reconstruction
-                    bougies 1 min officielles de Binance                   (build_bars_from_aggtrades) ou un
+    verification    bougies 1 s du perpétuel agrégées en 1 min,           après une modification de la reconstruction
+                    comparées aux bougies 1 min officielles de Binance     (build_bars_from_aggtrades) ou un
                                                                            (re)téléchargement du perpétuel
 
     Dataset         klines   bougies 1 s (spot et perpétuel)
@@ -79,14 +79,20 @@ Variables d'environnement optionnelles
     BINANCE_DATA_DIR            dossier des données (défaut : data/raw)
     KNOWN_GAPS_FILE             registre des trous longs (défaut : data/known_gaps.csv)
     SHORT_GAP_MAX_SECONDS       durée max d'un trou « court » (défaut : 60)
-    MAX_SHORT_GAP_RATIO         part max de secondes manquantes en trous courts (défaut : 0.005)
-    MAX_PRICE_JUMP              variation de prix max en 1 s (défaut : 0.10 = 10 %)
+    MAX_SHORT_GAP_RATIO         part max de secondes manquantes en trous courts, spot (défaut : 0.005)
+    MAX_SHORT_GAP_RATIO_PERP    idem pour le perpétuel (défaut : 0.60, simple garde-fou)
+    MAX_VOLUME_DEFICIT          volume manquant max par rapport aux bougies 1 min officielles (défaut : 0.01)
+    MAX_PRICE_JUMP              variation de prix max en 1 s, spot (défaut : 0.10 = 10 %)
+    MAX_PRICE_JUMP_PERP         idem pour le perpétuel (défaut : 0.15 = 15 %)
+    MAX_VOLUME_DRIFT            dérive max du volume cumulé vs officiel, en part du volume du mois (défaut : 0.001)
+    MAX_PRICE_EXCESS            dépassement toléré des prix extrêmes officiels voisins (défaut : 0.0005 = 0,05 %)
 
 Le vocabulaire financier (kline, spot, funding, taker…) est défini dans GLOSSAIRE.md.
 """
 from __future__ import annotations
 
 import os
+import warnings
 from datetime import date, timedelta
 
 import numpy as np
@@ -96,12 +102,29 @@ import pytest
 from download_binance import DATASETS
 from gaps import (
     SECOND_DATASETS, SHORT_GAP_MAX_SECONDS, data_dir, expected_range, files_of, find_gaps,
-    known_gaps_path, load_known_gaps, month_of, next_month, split_gaps, utc,
+    known_gaps_path, known_mismatches_path, load_known_gaps, load_known_mismatches, month_of,
+    next_month, split_gaps, utc,
 )
 
 DATA = data_dir()
-MAX_SHORT_GAP_RATIO = float(os.environ.get("MAX_SHORT_GAP_RATIO", "0.005"))
-MAX_PRICE_JUMP = float(os.environ.get("MAX_PRICE_JUMP", "0.10"))
+# Part max de secondes manquantes en trous courts, par marché. Le perpétuel a naturellement
+# beaucoup plus de secondes sans trade que le spot (jusqu'à ~45 % en 2020) : sa complétude
+# réelle est vérifiée par la catégorie `verification`, ce seuil n'est qu'un garde-fou.
+MAX_SHORT_GAP_RATIO = {
+    "spot_klines_1s": float(os.environ.get("MAX_SHORT_GAP_RATIO", "0.005")),
+    "futures_klines_1s": float(os.environ.get("MAX_SHORT_GAP_RATIO_PERP", "0.60")),
+}
+# Vérification du perpétuel contre les bougies 1 min officielles (voir TestPerpetualVsOfficial1m)
+MAX_VOLUME_DEFICIT = float(os.environ.get("MAX_VOLUME_DEFICIT", "0.01"))
+MAX_VOLUME_DRIFT = float(os.environ.get("MAX_VOLUME_DRIFT", "0.001"))
+MAX_PRICE_EXCESS = float(os.environ.get("MAX_PRICE_EXCESS", "0.0005"))
+# Saut de prix max en 1 s, par marché. Le perpétuel connaît de vraies mèches plus violentes
+# que le spot lors des cascades de liquidations (+12 % en 1 s le 18/04/2021, confirmé par
+# la bougie 1 min officielle).
+MAX_PRICE_JUMP = {
+    "spot_klines_1s": float(os.environ.get("MAX_PRICE_JUMP", "0.10")),
+    "futures_klines_1s": float(os.environ.get("MAX_PRICE_JUMP_PERP", "0.15")),
+}
 
 EXPECTED_KLINE_COLS = [c for c in DATASETS["spot_klines_1s"]["columns"] if c != "ignore"]
 
@@ -362,18 +385,25 @@ class TestKlinesGaps:
         """
         Les trous courts représentent une faible part du mois (MAX_SHORT_GAP_RATIO).
 
-        Pourquoi : quelques secondes sans trade sont normales, même sur BTCUSDT. Mais si
-        elles deviennent nombreuses, c'est que le marché était peu liquide ou que le
-        fichier est incomplet. Dans les deux cas, les secondes comblées artificiellement
-        (prix reporté, volume nul) deviennent une part significative des données : le
-        modèle apprendrait surtout du « rien ne se passe » fabriqué par nous.
+        Pourquoi : quelques secondes sans trade sont normales. Mais si elles deviennent
+        nombreuses, c'est que le marché était peu liquide ou que le fichier est incomplet.
+        Dans les deux cas, les secondes comblées artificiellement (prix reporté, volume
+        nul) deviennent une part significative des données : le modèle apprendrait surtout
+        du « rien ne se passe » fabriqué par nous.
+
+        Le seuil dépend du marché. Sur le spot, les klines 1 s de Binance sont presque
+        complètes (seuil 0,5 %). Le perpétuel, lui, a beaucoup de secondes réellement sans
+        trade, surtout en 2020 où l'activité était faible. Pour lui, ce test n'est qu'un
+        garde-fou contre un fichier vide aux trois quarts : la vraie vérification de
+        complétude est la comparaison avec les bougies 1 min officielles (`verification`).
         """
         path, _ = klines
         short, _, n_expected = kline_gaps
+        limit = MAX_SHORT_GAP_RATIO[dataset_of(path)]
         missing = int(short["duration_s"].sum())
         ratio = missing / n_expected
-        assert ratio <= MAX_SHORT_GAP_RATIO, (
-            f"{path.name} : {missing} s manquantes en trous courts ({ratio:.4%}, max {MAX_SHORT_GAP_RATIO:.4%})\n"
+        assert ratio <= limit, (
+            f"{path.name} : {missing} s manquantes en trous courts ({ratio:.4%}, max {limit:.4%})\n"
             f"{len(short)} trous courts, les plus longs :\n{describe_gaps(short)}"
         )
 
@@ -440,7 +470,8 @@ class TestKlinesPrices:
 
     def test_no_absurd_price_jump(self, klines):
         """
-        Pas de variation de prix supérieure à MAX_PRICE_JUMP (10 %) d'une seconde à l'autre.
+        Pas de variation de prix supérieure à MAX_PRICE_JUMP d'une seconde à l'autre
+        (10 % sur le spot, 15 % sur le perpétuel).
 
         Pourquoi : même lors des krachs les plus violents, le bitcoin ne perd pas 10 % en
         une seconde sur Binance spot. Un tel saut indique presque toujours une erreur
@@ -448,11 +479,21 @@ class TestKlinesPrices:
         la normalisation des features et peut devenir le « trade parfait » que le modèle
         cherchera ensuite à reproduire. Avec un levier x5, un tel saut en réel signifierait
         une liquidation : il faut en être certain avant de l'accepter.
+
+        Le perpétuel a un seuil plus large : lors des cascades de liquidations, il connaît
+        de vraies mèches extrêmes. Le 18/04/2021 à 03:35:44, il a pris 12 % en une seconde,
+        et la bougie 1 min officielle de Binance confirme ce plus haut.
+
+        Seules les bougies séparées d'exactement une seconde sont comparées : de part et
+        d'autre d'un trou (maintenance, journée manquante), le prix a pu varier de plus de
+        10 % sans que ce soit une erreur.
         """
-        _, df = klines
+        path, df = klines
+        limit = MAX_PRICE_JUMP[dataset_of(path)]
+        consecutive = df["open_time"].diff() == pd.Timedelta(seconds=1)
         ret = np.log(df["close"]).diff().abs()
-        jumps = df.loc[ret > np.log1p(MAX_PRICE_JUMP), "open_time"]
-        assert jumps.empty, f"{len(jumps)} sauts de prix > {MAX_PRICE_JUMP:.0%} en 1 s, ex. {jumps.head(3).tolist()}"
+        jumps = df.loc[consecutive & (ret > np.log1p(limit)), "open_time"]
+        assert jumps.empty, f"{len(jumps)} sauts de prix > {limit:.0%} en 1 s, ex. {jumps.head(3).tolist()}"
 
 
 
@@ -618,7 +659,27 @@ def perp_1s_vs_1m(request):
     )
     official = pd.read_parquet(path_1m)
     official = official[official["volume"] > 0].set_index("open_time")[ours.columns]
+
+    # minutes déclarées irréparables : retirées de la comparaison des deux côtés
+    known = load_known_mismatches()
+    invalid = known.loc[known["side"] == "zone_invalide", "minute"]
+    official = official[~official.index.isin(known.loc[known["side"] == "absente_chez_nous", "minute"])]
+    ours = ours[~ours.index.isin(known.loc[known["side"] == "absente_chez_binance", "minute"])]
+    # zones jugées non fiables (incident chez Binance) : exclues des deux côtés
+    official = official[~official.index.isin(invalid)]
+    ours = ours[~ours.index.isin(invalid)]
     return path_1s.name, ours, official
+
+
+def comparable(ours: pd.DataFrame, official: pd.DataFrame) -> pd.DataFrame:
+    """
+    Nos minutes, sans celles absentes des bougies officielles.
+
+    Quand le fichier officiel 1 min est lui-même incomplet, il n'y a rien à quoi comparer
+    ces minutes : les garder ferait échouer les tests de prix et de dérive à cause d'un
+    trou chez Binance, pas chez nous. Elles sont signalées par test_no_missing_minutes.
+    """
+    return ours[ours.index.isin(official.index)]
 
 
 @pytest.mark.perp
@@ -629,66 +690,157 @@ class TestPerpetualVsOfficial1m:
     aggTrades, sont-elles justes ?
 
     Binance ne publie pas de bougies 1 s pour les futures, mais publie des bougies 1 min,
-    calculées de son côté. En agrégeant nos bougies 1 s par minute, on doit retrouver
-    exactement les bougies officielles. C'est un contrôle par une source indépendante :
-    contrairement aux autres tests, qui vérifient la cohérence interne des données, il
-    détecte aussi une erreur plausible mais fausse (trade oublié, mauvais sens
-    acheteur / vendeur, erreur d'arrondi, décalage d'horodatage).
+    calculées de son côté. En agrégeant nos bougies 1 s par minute, on les compare à ces
+    bougies officielles. C'est un contrôle par une source indépendante : contrairement aux
+    autres tests, qui vérifient la cohérence interne, il détecte aussi une erreur plausible
+    mais fausse (trade oublié, mauvais sens acheteur / vendeur, décalage d'horodatage).
+
+    Pourquoi la concordance minute par minute n'est pas parfaite : certains trades situés
+    à quelques millisecondes d'un changement de minute sont rangés dans la minute voisine
+    chez Binance. Sur juin 2023, 76 % des minutes en excès sont compensées exactement par la
+    minute d'à côté, et le volume du mois est identique. L'horodatage des aggTrades diffère
+    donc très légèrement de celui des bougies officielles. Pour un modèle à la seconde, un
+    décalage de quelques millisecondes est sans conséquence.
+
+    Les tests vérifient donc ce qui doit rester vrai malgré ces déplacements :
+    - aucune minute officielle ne manque chez nous ;
+    - nos prix extrêmes restent dans ceux des minutes officielles voisines ;
+    - le volume cumulé ne dérive jamais durablement (un trade déplacé est compensé à la
+      minute suivante, un trade perdu ou en double crée une dérive qui persiste) ;
+    - le volume total du mois concorde.
+
+    Le nombre de trades (n_trades) n'est pas comparé : nous le calculons à partir des plages
+    d'identifiants des aggTrades, qui incluent des identifiants qui ne sont pas des trades de
+    marché. C'est une approximation par excès, à ne pas utiliser comme une valeur exacte.
     """
 
-    def test_same_minutes(self, perp_1s_vs_1m):
+    def test_no_missing_minutes(self, perp_1s_vs_1m):
         """
-        Les minutes avec des trades sont les mêmes des deux côtés.
+        Toute minute avec des trades chez Binance existe aussi dans nos données.
 
-        Pourquoi : une minute présente chez Binance mais absente chez nous signifie que des
-        trades ont été perdus (morceau de fichier mal lu, jour manquant). L'inverse
-        signifierait des trades horodatés dans la mauvaise minute, voire inventés.
+        Pourquoi : une minute absente chez nous signifie que des trades ont été perdus. Des
+        blocs de 1 440 minutes (journées entières) indiquent un fichier mensuel incomplet
+        chez Binance : download_binance.py les répare avec les fichiers journaliers.
+
+        Les minutes présentes chez nous mais absentes des bougies officielles sont
+        seulement signalées par un avertissement : c'est alors le fichier officiel 1 min
+        qui est incomplet, pas nos données. Elles sont exclues des autres comparaisons.
+        Dans les deux cas, download_binance.py tente de réparer la journée concernée.
+
+        Si le fichier journalier de Binance est lui aussi incomplet, la minute est
+        irréparable. Après vérification, `python diagnose_perp.py --register` l'enregistre
+        dans data/known_minute_mismatches.csv, et elle est alors exclue de toutes les
+        comparaisons (même principe que known_gaps.csv pour les trous longs).
         """
         name, ours, official = perp_1s_vs_1m
         missing = official.index.difference(ours.index)
         extra = ours.index.difference(official.index)
-        assert missing.empty and extra.empty, (
-            f"{name} : {len(missing)} minute(s) absente(s) de nos données "
-            f"(ex. {list(missing[:3])}), {len(extra)} minute(s) en trop (ex. {list(extra[:3])})"
+        if not extra.empty:
+            warnings.warn(f"{name} : {len(extra)} minute(s) absente(s) des bougies 1 min officielles, "
+                          f"ex. {list(extra[:3])}", stacklevel=1)
+        days = pd.Series(missing.floor("D")).value_counts().sort_index()
+        full_days = [f"{d:%Y-%m-%d}" for d, n in days.items() if n >= 1440]
+        assert missing.empty, (
+            f"{name} : {len(missing)} minute(s) absente(s) de nos données, ex. {list(missing[:3])}\n"
+            f"journées entières manquantes : {full_days or 'aucune'}\n"
+            "Relance download_binance.py (réparation des jours manquants), puis python gaps.py. "
+            f"Si elles persistent, vérifie-les puis enregistre-les dans {known_mismatches_path()} "
+            "avec `python diagnose_perp.py --register`."
         )
 
-    def test_prices_match(self, perp_1s_vs_1m):
+    def test_prices_within_neighbours(self, perp_1s_vs_1m):
         """
-        open, high, low et close coïncident à la minute près.
+        Notre plus haut et notre plus bas restent dans ceux des minutes officielles voisines.
 
-        Pourquoi : les prix d'ouverture et de clôture dépendent de l'ordre des trades, le
-        plus haut et le plus bas de leur exhaustivité. Une différence révèle un tri
-        incorrect ou des trades manquants, ce qui fausserait directement les rendements
-        et les simulations de stop-loss du backtest.
+        Pourquoi : un trade peut être rangé dans la minute d'à côté, mais son prix, lui,
+        existe forcément chez Binance. Notre high d'une minute ne peut donc pas dépasser le
+        plus haut officiel de cette minute et de ses deux voisines, et de même pour le low.
+        Un dépassement signalerait un prix inventé : mauvaise colonne, erreur de parsing,
+        trade d'une autre paire. C'est ce qui protège les simulations de stop-loss du
+        backtest, qui se déclenchent sur les extrêmes.
+
+        Tolérance MAX_PRICE_EXCESS (0,05 %) : de rares trades isolés dépassent de quelques
+        dollars l'extrême officiel (par exemple 82 047,8 contre 82 032,3 le 10/03/2025, soit
+        0,02 %). Une erreur de parsing ou de colonne produirait des écarts bien plus grands.
+        """
+        name, ours, official = perp_1s_vs_1m
+        ours = comparable(ours, official)
+        # les minutes qui bordent un trou enregistré des bougies officielles n'ont pas de
+        # voisine de référence complète : un trade rangé dans la minute absente ne peut pas
+        # être vérifié, on ne les compare donc pas
+        known = load_known_mismatches()
+        holes = pd.DatetimeIndex(known.loc[known["side"] == "absente_chez_binance", "minute"])
+        one = pd.Timedelta(minutes=1)
+        ours = ours[~ours.index.isin(holes.union(holes - one).union(holes + one))]
+        grid = official.reindex(ours.index.union(official.index))
+        high_ref = grid["high"].rolling(3, center=True, min_periods=1).max().reindex(ours.index)
+        low_ref = grid["low"].rolling(3, center=True, min_periods=1).min().reindex(ours.index)
+        bad_high = ours["high"] > high_ref * (1 + MAX_PRICE_EXCESS)
+        bad_low = ours["low"] < low_ref * (1 - MAX_PRICE_EXCESS)
+        errors = [f"{label} : {bad.sum()} minutes, ex. {list(ours.index[bad.values][:3])}"
+                  for label, bad in (("high au-dessus des voisines officielles", bad_high),
+                                     ("low en dessous des voisines officielles", bad_low)) if bad.any()]
+        assert not errors, f"{name}\n" + "\n".join(errors)
+
+    def test_no_volume_drift(self, perp_1s_vs_1m):
+        """
+        L'écart de volume cumulé avec Binance ne dérive jamais (MAX_VOLUME_DRIFT, 0,1 % du mois).
+
+        Pourquoi : on additionne, minute après minute, l'écart entre notre volume et le volume
+        officiel. Un trade rangé dans la minute voisine fait monter cet écart cumulé puis le
+        ramène à zéro dès la minute suivante : c'est inoffensif. Un trade perdu, compté deux
+        fois ou attribué au mauvais sens crée au contraire un écart qui persiste. On vérifie
+        la même chose pour le volume acheteur (taker_buy_base), dont dépend la feature de
+        pression acheteurs / vendeurs.
+
+        C'est ce test qui a révélé les aggTrades en double des 12 et 13/09/2022 (volume
+        exactement doublé). Le seuil de 0,1 % laisse passer les petits écarts persistants des
+        semaines agitées, dus aux trades de liquidation absents des aggTrades (0,07 % en
+        juin 2026).
+        """
+        name, ours, official = perp_1s_vs_1m
+        ours = comparable(ours, official)
+        idx = ours.index.union(official.index)
+        total = official["volume"].sum()
+        errors = []
+        for col in ("volume", "taker_buy_base"):
+            diff = ours[col].reindex(idx, fill_value=0) - official[col].reindex(idx, fill_value=0)
+            drift = diff.cumsum().abs()
+            if drift.max() > MAX_VOLUME_DRIFT * total:
+                errors.append(f"{col} : dérive max {drift.max():.3f} BTC ({drift.max() / total:.4%} du volume "
+                              f"du mois, max {MAX_VOLUME_DRIFT:.4%}) le {drift.idxmax()}")
+        assert not errors, f"{name}\n" + "\n".join(errors)
+
+    def test_volume_deficit(self, perp_1s_vs_1m):
+        """
+        Le volume du mois concorde avec les bougies officielles, à MAX_VOLUME_DEFICIT près (1 %),
+        dans un sens comme dans l'autre : un volume trop faible signale des trades perdus, un
+        volume trop élevé des trades en double.
+
+        Pourquoi : c'est le contrôle d'ensemble. Les déplacements de trades entre minutes se
+        compensent sur le mois ; un écart persistant signifie que des trades manquent. La
+        documentation de Binance indique aussi que les aggTrades excluent les trades du fonds
+        d'assurance et de l'ADL : s'ils comptaient dans les bougies officielles, ils
+        apparaîtraient ici, d'où une petite tolérance.
+
+        On mesure le volume plutôt que la part de minutes identiques : un seul trade déplacé
+        suffit à rendre deux minutes différentes, et plus le marché est actif, plus il y a de
+        minutes concernées, même si le volume en jeu reste négligeable. Le message d'erreur
+        affiche aussi la part de minutes différentes par colonne, à titre d'information.
         """
         name, ours, official = perp_1s_vs_1m
         common = ours.index.intersection(official.index)
-        errors = []
-        for col in ("open", "high", "low", "close"):
-            a, b = ours.loc[common, col], official.loc[common, col]
-            bad = ~np.isclose(a, b, rtol=1e-9, atol=0)
-            if bad.any():
-                errors.append(f"{col} : {bad.sum()} minutes différentes, ex. {list(common[bad][:3])}")
-        assert not errors, f"{name}\n" + "\n".join(errors)
-
-    def test_volumes_match(self, perp_1s_vs_1m):
-        """
-        Volumes, nombre de trades et volume acheteur coïncident.
-
-        Pourquoi : le volume acheteur (taker_buy_base) dépend de l'interprétation du
-        champ is_buyer_maker des aggTrades. Une inversion de ce champ passerait tous les
-        tests de cohérence interne, mais inverserait le sens de la pression
-        acheteurs / vendeurs, une des features les plus importantes du modèle.
-        """
-        name, ours, official = perp_1s_vs_1m
-        common = ours.index.intersection(official.index)
-        errors = []
-        for col in ("volume", "quote_volume", "n_trades", "taker_buy_base"):
-            a, b = ours.loc[common, col], official.loc[common, col]
-            bad = ~np.isclose(a, b, rtol=1e-6, atol=1e-8)
-            if bad.any():
-                errors.append(f"{col} : {bad.sum()} minutes différentes, ex. {list(common[bad][:3])}")
-        assert not errors, f"{name}\n" + "\n".join(errors)
+        a, b = ours.loc[common], official.loc[common]
+        deficit = abs(1 - a["volume"].sum() / b["volume"].sum())
+        detail = ", ".join(
+            f"{c} {1 - np.isclose(a[c], b[c], rtol=1e-9, atol=1e-9).mean():.2%}"
+            for c in ("open", "high", "low", "close", "volume")
+        )
+        assert deficit <= MAX_VOLUME_DEFICIT, (
+            f"{name} : écart de volume {deficit:.3%} (max {MAX_VOLUME_DEFICIT:.2%}), "
+            f"nous {a['volume'].sum():.1f} BTC contre {b['volume'].sum():.1f} chez Binance\n"
+            f"minutes différentes par colonne : {detail}"
+        )
 
 
 # =========================================================================== funding

@@ -42,6 +42,7 @@ Toutes les commandes se lancent **depuis la racine du dépôt**.
 .
 ├── download_binance.py      # téléchargement incrémental depuis Binance Vision
 ├── gaps.py                  # détection des secondes manquantes + registre des trous longs
+├── diagnose_perp.py         # diagnostic mois par mois : perpétuel 1 s vs bougies 1 min officielles
 ├── tests/
 │   └── test_data_quality.py # tests de qualité des données (pytest)
 ├── pytest.ini               # configuration pytest et déclaration des catégories de tests
@@ -72,6 +73,7 @@ Toutes les bougies 1 s ont les mêmes colonnes : `open_time`, `open`, `high`, `l
 
 - **Un fichier Parquet par mois**, depuis janvier 2020. Le mois en cours est complété jour par jour, jusqu'à la veille.
 - **Incrémental** : un mois déjà présent sur disque n'est pas re-téléchargé, et une ligne déjà présente n'est jamais ajoutée deux fois. On peut interrompre le script et le relancer à tout moment.
+- **Réparation des jours manquants** : les fichiers mensuels de Binance Vision omettent parfois des journées entières. Le script les récupère automatiquement dans les fichiers journaliers (désactivable avec `--no-repair`).
 - **Intégrité** : le SHA256 de chaque ZIP est vérifié, et chaque fichier est écrit de façon atomique, donc jamais laissé à moitié écrit.
 - **Bougies 1 s du perpétuel reconstruites** : Binance ne publie pas de bougies 1 s pour les futures. Le script les calcule à partir des *aggTrades* (toutes les transactions), en lisant les fichiers par morceaux pour limiter la mémoire à environ 1 à 2 Go.
 
@@ -119,7 +121,7 @@ pytest --lf                             # seulement ce qui a échoué la derniè
 | `coherence` | prix positifs, high/low cohérents avec open/close, pas de saut de prix absurde, funding dans des bornes réalistes |
 | `volumes` | volumes positifs, volume acheteur ≤ volume total, prix moyen (VWAP) entre low et high |
 | `registre` | `known_gaps.csv` bien formé, sans chevauchement |
-| `verification` | bougies 1 s du perpétuel agrégées en 1 min = bougies 1 min officielles de Binance |
+| `verification` | bougies 1 s du perpétuel agrégées en 1 min, comparées aux bougies 1 min officielles : aucune minute manquante, prix extrêmes cohérents avec les minutes voisines, volume cumulé sans dérive, volume du mois concordant |
 
 | Étiquette de dataset | Portée |
 |---|---|
@@ -128,6 +130,8 @@ pytest --lf                             # seulement ce qui a échoué la derniè
 | `funding` | funding rate |
 
 Chaque test explique dans sa docstring **pourquoi** il existe, c'est-à-dire quelle erreur de modèle il évite. Le tableau « quand relancer quelle catégorie » se trouve en tête de `tests/test_data_quality.py`.
+
+**Pourquoi le perpétuel ne concorde pas à 100 % minute par minute** : quelques trades situés à quelques millisecondes d'un changement de minute sont rangés dans la minute voisine chez Binance. Le volume du mois est identique et les écarts se compensent d'une minute à l'autre. Par ailleurs, `n_trades` du perpétuel est une approximation par excès (calculée à partir des plages d'identifiants des aggTrades). `python diagnose_perp.py` affiche ces écarts mois par mois.
 
 Les seuils se règlent par variables d'environnement, par exemple `MAX_SHORT_GAP_RATIO=0.01 pytest -m completude`. La liste complète est en tête du fichier de tests.
 

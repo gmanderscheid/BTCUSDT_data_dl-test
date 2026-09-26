@@ -18,6 +18,11 @@ Fonctionnement
 - Ne rajoute jamais une ligne déjà présente : les nouvelles données sont fusionnées
   avec le fichier existant et dédoublonnées sur la clé temporelle.
 - Un mois passé déjà présent sur disque n'est pas re-téléchargé (sauf --force).
+- Réparation des jours manquants : les fichiers mensuels de Binance Vision omettent parfois
+  des journées entières. Pour chaque mois, les jours totalement absents sont recherchés dans
+  les fichiers journaliers et ajoutés. Pour le perpétuel, les journées PARTIELLEMENT
+  manquantes sont aussi détectées en croisant les bougies 1 s et les bougies 1 min
+  officielles (désactivable avec --no-repair).
 - Les ZIP sont écrits sur disque (data/_downloads/) au fil du téléchargement, puis
   supprimés une fois traités : un fichier d'aggTrades de 700 Mo ne passe jamais en mémoire.
 - Vérifie le SHA256 de chaque ZIP avec le fichier .CHECKSUM fourni par Binance.
@@ -27,6 +32,7 @@ Usage
     python download_binance.py                                   # tous les datasets
     python download_binance.py --datasets futures_klines_1s      # un seul dataset
     python download_binance.py --datasets spot_klines_1s --force # re-télécharge tout
+    python download_binance.py --no-repair                       # sans réparation des jours manquants
 """
 from __future__ import annotations
 
@@ -176,13 +182,30 @@ def build_bars_from_aggtrades(zip_path: Path, spec: dict) -> pd.DataFrame:
     Une seconde peut être coupée entre deux morceaux : les bougies partielles sont donc
     ré-agrégées à la fin avec les mêmes règles (first / max / min / last / sum). Comme les
     morceaux sont lus dans l'ordre, « first » et « last » restent corrects.
+
+    Dédoublonnage : certains fichiers de Binance Vision contiennent des aggTrades en double
+    (constaté les 12 et 13/09/2022, où le volume était exactement doublé). Chaque aggTrade a
+    un identifiant unique (agg_trade_id), croissant dans le fichier. On ne garde donc que
+    la première occurrence de chaque identifiant, y compris quand le doublon se trouve dans
+    un morceau ultérieur (identifiant inférieur ou égal au plus grand déjà vu).
     """
     skip = 1 if has_header(zip_path) else 0
     parts = []
+    max_seen = -1
+    dropped = 0
     with zipfile.ZipFile(zip_path) as z, z.open(z.namelist()[0]) as f:
         reader = pd.read_csv(f, header=None, names=AGG_TRADE_COLS, skiprows=skip, chunksize=CHUNK_ROWS)
         for chunk in reader:
+            ids = pd.to_numeric(chunk["agg_trade_id"])
+            keep = ~ids.duplicated() & (ids > max_seen)
+            dropped += int((~keep).sum())
+            chunk = chunk[keep.values]
+            if chunk.empty:
+                continue
+            max_seen = max(max_seen, int(ids[keep].max()))
             parts.append(trades_to_partial_bars(chunk))
+    if dropped:
+        log.warning("%s : %d aggTrades en double ignorés", zip_path.name, dropped)
 
     bars = pd.concat(parts).groupby(level=0, sort=True).agg(BAR_AGG).reset_index()
     bars["close_time"] = bars["open_time"] + pd.Timedelta(milliseconds=999)
@@ -279,36 +302,90 @@ def fetch_and_store(rel_path: str, out: Path, spec: dict, label: str) -> None:
         zip_path.unlink(missing_ok=True)
 
 
-def sync_dataset(name: str, spec: dict, force: bool = False) -> None:
+def fill_missing_days(name: str, spec: dict, out: Path, first_day: date, end_day: date) -> None:
+    """
+    Télécharge les fichiers journaliers des jours de [first_day, end_day[ totalement absents de `out`.
+
+    Pourquoi : les fichiers mensuels de Binance Vision omettent parfois des journées entières
+    (constaté sur les aggTrades du perpétuel). Sans réparation, ces journées apparaissent comme
+    des « trous longs » que l'on pourrait prendre à tort pour des fermetures de l'exchange.
+    Si le fichier journalier n'existe pas non plus, le jour reste manquant et les tests le signaleront.
+    """
+    already = days_present(out, spec["key"])
+    d = first_day
+    while d < end_day:
+        if d not in already:
+            fetch_and_store(spec["daily"].format(period=d.isoformat()), out, spec, f"{name} {d}")
+        d += timedelta(days=1)
+
+
+def sync_dataset(name: str, spec: dict, force: bool = False, repair: bool = True) -> None:
     today = date.today()
     current_month = today.replace(day=1)
     out_dir = DATA_DIR / name
 
-    # 1) Mois complets : fichiers mensuels
+    # 1) Mois complets : fichiers mensuels, puis réparation des jours manquants
     for m in month_starts(START, current_month):
         period = m.strftime("%Y-%m")
         out = out_dir / f"{name}_{period}.parquet"
         if out.exists() and not force:
             log.debug("%s %s déjà présent, ignoré", name, period)
-            continue
-        fetch_and_store(spec["monthly"].format(period=period), out, spec, f"{name} {period}")
+        else:
+            fetch_and_store(spec["monthly"].format(period=period), out, spec, f"{name} {period}")
+
+        # on ne répare que les mois dont Binance a publié au moins une partie
+        if repair and spec["daily"] is not None and out.exists():
+            month_end = (m.replace(day=28) + timedelta(days=4)).replace(day=1)
+            fill_missing_days(name, spec, out, m, month_end)
 
     # 2) Mois en cours : fichiers journaliers jusqu'à hier
     if spec["daily"] is None:
         return
     out = out_dir / f"{name}_{current_month:%Y-%m}.parquet"
-    already = days_present(out, spec["key"])
-    d = current_month
-    while d < today:
-        if d not in already:
-            fetch_and_store(spec["daily"].format(period=d.isoformat()), out, spec, f"{name} {d}")
-        d += timedelta(days=1)
+    fill_missing_days(name, spec, out, current_month, today)
+
+
+def repair_perp_partial_days() -> None:
+    """
+    Répare les journées PARTIELLEMENT manquantes du perpétuel, en croisant les bougies 1 s
+    reconstruites et les bougies 1 min officielles.
+
+    Pourquoi : certains fichiers mensuels de Binance Vision sont tronqués au milieu d'une
+    journée (par exemple le 13/04/2020 à partir de 00:32). fill_missing_days ne voit que les
+    journées totalement vides. Ici, pour chaque jour :
+    - s'il manque chez nous des minutes présentes dans les bougies officielles, on
+      re-télécharge le fichier journalier d'aggTrades de ce jour ;
+    - s'il manque dans les bougies officielles des minutes présentes chez nous, c'est le
+      fichier officiel qui est tronqué : on re-télécharge le fichier journalier 1 min.
+    La fusion ne rajoute que les lignes absentes. Si le fichier journalier est lui aussi
+    incomplet, rien ne change et les tests de vérification continueront de le signaler.
+    """
+    spec_1s, spec_1m = DATASETS["futures_klines_1s"], DATASETS["futures_klines_1m"]
+    dir_1s, dir_1m = DATA_DIR / "futures_klines_1s", DATA_DIR / "futures_klines_1m"
+    for path_1s in sorted(dir_1s.glob("futures_klines_1s_*.parquet")):
+        period = path_1s.stem.rsplit("_", 1)[-1]
+        path_1m = dir_1m / f"futures_klines_1m_{period}.parquet"
+        if not path_1m.exists():
+            continue
+        ours = pd.read_parquet(path_1s, columns=["open_time"])["open_time"].dt.floor("min").unique()
+        off = pd.read_parquet(path_1m, columns=["open_time", "volume"])
+        off = off.loc[off["volume"] > 0, "open_time"].unique()
+        ours, off = pd.DatetimeIndex(ours), pd.DatetimeIndex(off)
+
+        for d in sorted(set(off.difference(ours).date)):
+            log.info("futures_klines_1s %s : journée incomplète, nouvelle tentative avec le fichier journalier", d)
+            fetch_and_store(spec_1s["daily"].format(period=d.isoformat()), path_1s, spec_1s, f"futures_klines_1s {d}")
+        for d in sorted(set(ours.difference(off).date)):
+            log.info("futures_klines_1m %s : bougies officielles incomplètes, nouvelle tentative", d)
+            fetch_and_store(spec_1m["daily"].format(period=d.isoformat()), path_1m, spec_1m, f"futures_klines_1m {d}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--datasets", nargs="*", default=list(DATASETS), choices=list(DATASETS))
     parser.add_argument("--force", action="store_true", help="re-télécharge les mois déjà présents")
+    parser.add_argument("--no-repair", action="store_true",
+                        help="ne cherche pas les jours manquants dans les fichiers journaliers")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -317,7 +394,11 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     for name in args.datasets:
-        sync_dataset(name, DATASETS[name], force=args.force)
+        sync_dataset(name, DATASETS[name], force=args.force, repair=not args.no_repair)
+
+    # réparation croisée des journées partiellement manquantes du perpétuel
+    if not args.no_repair and {"futures_klines_1s", "futures_klines_1m"} & set(args.datasets):
+        repair_perp_partial_days()
 
 
 if __name__ == "__main__":

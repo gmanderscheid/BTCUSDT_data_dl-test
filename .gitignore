@@ -4,6 +4,7 @@
 data/*
 # ... sauf le registre des trous longs : petit, et il contient les raisons saisies à la main.
 !data/known_gaps.csv
+!data/known_minute_mismatches.csv
 *.parquet
 *.zip
 *.tmp

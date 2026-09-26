@@ -112,6 +112,39 @@ def expected_range(path: Path, df: pd.DataFrame, is_first_file: bool,
     return start, end
 
 
+# --------------------------------------------------------------------------- minutes irréparables du perpétuel
+
+MISMATCH_COLUMNS = ["side", "minute", "official_volume", "reason"]
+
+
+def known_mismatches_path() -> Path:
+    """
+    Registre des minutes du perpétuel qui diffèrent de façon IRRÉPARABLE des bougies 1 min
+    officielles (data/known_minute_mismatches.csv), rempli par `python diagnose_perp.py --register`.
+
+    side = "absente_chez_nous"    : Binance a une bougie officielle, mais aucun aggTrade,
+                                    même dans le fichier journalier (probablement une minute
+                                    où seuls des trades du fonds d'assurance / ADL ont eu lieu) ;
+    side = "absente_chez_binance" : nous avons des aggTrades, mais le fichier officiel 1 min
+                                    n'a pas de bougie, même dans le fichier journalier ;
+    side = "zone_invalide"        : minute ajoutée À LA MAIN, présente des deux côtés mais
+                                    jugée non fiable (incident chez Binance, horodatages
+                                    perturbés). Exclue des comparaisons, et à exclure aussi de
+                                    la construction des features. Conservée par --register.
+    """
+    return Path(os.environ.get("KNOWN_MISMATCHES_FILE", data_dir().parent / "known_minute_mismatches.csv"))
+
+
+def load_known_mismatches(path: Path | None = None) -> pd.DataFrame:
+    path = path or known_mismatches_path()
+    if not path.exists():
+        return pd.DataFrame(columns=MISMATCH_COLUMNS)
+    df = pd.read_csv(path, dtype={"reason": "string"})
+    df["minute"] = pd.to_datetime(df["minute"], utc=True)
+    df["reason"] = df["reason"].fillna("")
+    return df
+
+
 # --------------------------------------------------------------------------- détection
 
 def find_gaps(timestamps: pd.Series, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
