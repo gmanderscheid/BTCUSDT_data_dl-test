@@ -49,7 +49,9 @@ Récupérer **gratuitement** un historique **à la seconde depuis janvier 2020**
 
 ## État final
 
-**Tous les tests passent.** Les écarts résiduels avec la référence officielle sont **expliqués, quantifiés et enregistrés** dans des registres versionnés. Aucun écart n'est masqué silencieusement.
+À la fin de la séance, tous les tests passaient, et les écarts résiduels avec la référence officielle étaient expliqués, quantifiés et enregistrés dans des registres versionnés.
+
+**Une revue externe (Astra, 26/09/2026) a ensuite montré que « pytest vert » ne suffisait pas encore à valider l'historique** : couverture non bloquante, contrôles de prix et de volume trop permissifs, registre qui valait acceptation, absence de tests unitaires du pipeline. Tous ses constats ont été pris en compte (partie 3). Les tests doivent être relancés sur l'historique réel avec la nouvelle version.
 
 ## Limites connues, à garder en tête
 
@@ -161,7 +163,7 @@ Le premier lancement des tests sur le perpétuel a donné 246 échecs. Trois fam
 
 **Première hypothèse, partiellement invalidée :** la documentation de Binance indique que les aggTrades excluent les trades du fonds d'assurance et de l'ADL. Nos trades formeraient donc un sous-ensemble, et on ne dépasserait jamais l'officiel. Or le test de bornes a montré qu'on le **dépasse** sur certaines minutes. Cette hypothèse ne suffit donc pas.
 
-**Explication retenue, étayée par une mesure :** **76 % des minutes en excès sont compensées exactement par la minute voisine** (juin 2023). Certains trades situés à quelques millisecondes d'un changement de minute sont rangés dans la minute d'à côté chez Binance. C'est sans conséquence pour un modèle, même à la seconde.
+**Explication retenue, étayée par une mesure :** **76 % des minutes en excès sont compensées exactement par la minute voisine** (juin 2023). Certains trades situés près d'un changement de minute sont rangés dans la minute d'à côté chez Binance. *Reformulé après la revue* : la compensation des volumes montre qu'il s'agit de déplacements, mais ne borne ni leur amplitude, ni leur effet sur des features à la seconde (un trade proche d'une frontière peut changer de seconde). Leur effet n'est donc **pas démontré négligeable**.
 
 **Refonte des tests de vérification** pour qu'ils restent stricts malgré ces déplacements :
 
@@ -254,7 +256,7 @@ Suggestions de points à examiner dans le code :
 4. **`to_datetime`** : la détection ms / µs se fait par seuil sur la valeur maximale de chaque fichier ou morceau.
 5. **Tests de vérification** : logique d'exclusion des minutes du registre et de leurs voisines ; calcul de la dérive cumulée.
 6. **Seuils** : pertinence des valeurs par défaut (section 8).
-7. **Absence de test unitaire du code lui-même.** Les tests portent sur les **données**. La logique de reconstruction a été validée par des simulations ponctuelles pendant la séance, mais ces simulations ne sont pas versionnées comme tests automatisés.
+7. ~~Absence de test unitaire du code lui-même.~~ Corrigé après la revue : voir `tests/test_pipeline.py` (partie 3).
 
 ## 11. Suite prévue
 
@@ -263,3 +265,64 @@ La donnée étant validée, les prochaines étapes sont :
 - les trois variables cibles, en intégrant les frais (environ 0,05 % en taker), le funding et une estimation du spread (méthode *triple barrier* envisagée) ;
 - le suivi des expériences dans MLflow ;
 - un backtest avec levier, qui simule les stop-loss sur high et low.
+
+---
+
+# Partie 3 : Prise en compte de la revue externe
+
+La revue d'Astra (26/09/2026) a examiné le code et exécuté des contre-exemples sur données synthétiques. Son avis : une base utile, mais pas encore suffisante pour considérer l'historique comme « validé pour l'entraînement ». Ses constats étaient fondés : plusieurs contre-exemples passaient les tests alors qu'ils auraient dû échouer. Chacun a été corrigé, et **chaque contre-exemple est désormais un test unitaire** dans `tests/test_pipeline.py`. Il échouerait si la correction était retirée.
+
+## Changements d'architecture
+
+| Nouveau fichier | Rôle |
+|---|---|
+| `quality_checks.py` | Tous les contrôles et seuils, partagés par pytest et `diagnose_perp.py` (plus de divergence entre diagnostic et validation) |
+| `data_contract.py` | Contrat de couverture : datasets requis, premier mois (2020-01), dernier mois attendu, référence 1 min pour chaque mois du perpétuel |
+| `approve.py` | Approbation tracée des anomalies examinées |
+| `tests/test_pipeline.py` | 61 tests unitaires sur données synthétiques, sans données réelles |
+| `data/manifest.csv`, `data/repair_attempts.csv` | Provenance de chaque fichier intégré, réparations déjà tentées |
+
+## Traçabilité constat → correction → preuve
+
+| # | Constat de la revue | Correction | Test qui le prouve (`test_pipeline.py` sauf mention) |
+|---|---|---|---|
+| 1 | Sans données ou avec une référence absente, pytest reste vert (35 tests ignorés) | Contrat de couverture bloquant ; mode `partial` explicite et signalé ; part minimale de minutes comparées (99 %) ; volume exclu par le registre borné (0,5 %) ; minutes absentes de la référence bloquantes | `TestCoverageContract`, `test_comparison_coverage` (données) ; vérifié : sans données, 16 échecs en mode `complete` |
+| 2 | OHLC plats à 100 contre 99/110/90/101 : la vérification passe | Détection des **mèches disparues** (extrême officiel absent de nos données) en plus des extrêmes inventés ; contrôle du close (≤ 0,5 % de minutes différentes) ; reconstruction vérifiée contre des valeurs calculées à la main | `test_flat_bars_with_missing_wicks_fail`, `TestReconstruction.test_exact_bars` (tailles de morceaux 1, 2, 3, 100 ; avec et sans en-tête ; ms et µs) |
+| 3 | Une heure amputée de 30 % passe (0,04 % du mois) | Contrôles **locaux** : volume et volume acheteur par jour (0,5 %) et par heure (5 % ou 100 BTC) ; `test_volume_deficit` documenté comme portant sur les minutes communes | `test_one_hour_loss_is_caught_locally`, avec le cas positif `test_shifted_trades_are_accepted` |
+| 4 | Voisines = lignes : 00:00 / 00:01 / 02:00 élargit la référence | Voisines = minutes **exactes** t−1, t, t+1 ; une minute dont une voisine n'existe que d'un côté est non vérifiable (et comptée) | `test_neighbours_are_exact_minutes` |
+| 5 | Un seul paiement de funding passe les 6 tests | **Échéancier exact** du mois (tous les multiples de l'intervalle depuis 00:00 : ni manquant, ni en trop) ; schéma et UTC ; médiane du taux contre une erreur d'unité ×100 | `TestFundingChecks` (paiement manquant au début, à la fin, au milieu ; fichier à une ligne ; paiement en trop ; erreur d'unité) |
+| 6 | Le registre vaut acceptation (raison vide acceptée) | Statuts `candidate` / `approved` ; raison obligatoire ; `approve.py` ; exceptions obsolètes bloquantes ; test de structure du registre des minutes | `TestRegistryChecks`, `TestGapRegistry`, `TestMismatchRegistry` (données) |
+| 7a | Durée négative acceptée avant un trou | `close_time >= open_time` imposé ; seconde suivante cherchée aussi dans le fichier du mois suivant ; fin en µs acceptée | `test_negative_duration_before_gap_fails`, `test_truncated_candle_rules`, `test_microsecond_end_is_normal` |
+| 7b | `n_trades = +inf` passe ; référence 1 min sans contrôles propres | Contrôle de finitude et `n_trades` entier ; classe `TestReference1m` (structure, temps, valeurs) ; dérive NaN bloquante | `test_infinite_n_trades_fails`, `test_nan_drift_fails` |
+| 7c | Seuil de saut logarithmique : −9,5 % échoue à « 10 % » | Rendement **simple**, symétrique | `test_price_jump_is_symmetric_in_simple_return` |
+| 7d | Marge VWAP non documentée ; pas de VWAP acheteur | Marge documentée comme non calibrée ; VWAP acheteur ; cohérence des volumes nuls | `test_buyer_vwap_out_of_range_fails`, `test_quote_without_base_fails` |
+| 8a | Checksum en erreur 500 : ZIP accepté | Checksum **obligatoire** : faux, vide, mal formé ou erreur serveur = échec (après nouvelles tentatives) ; absence de `.CHECKSUM` bloquante sauf `--allow-missing-checksum` | `TestDownload` (6 cas) |
+| 8b | `--force` ne remplace pas une valeur existante | `--force` **remplace** le mois ; réparation par remplacement de la journée si le fichier journalier couvre au moins les mêmes instants ; jamais d'addition de deux bougies d'une même seconde | `test_force_replaces_existing_month`, `test_replace_only_if_superset`, `test_merge_is_idempotent_and_add_only` |
+| 8c | Journée amputée sans minute disparue non réparée | Réparation déclenchée aussi par un écart de volume journalier > 0,5 % avec la référence | `test_day_with_all_minutes_but_missing_volume_is_flagged` |
+| 8d | Identifiants 1, 3, 2, 4 : trade inédit supprimé silencieusement | Ordre **vérifié** : identifiant inédit hors ordre = `AggTradeOrderError` ; identifiants vus stockés en intervalles (mémoire compacte) ; horodatages en recul signalés | `test_unordered_new_id_fails_loudly` (morceaux de 2 et 10), `test_repeated_block_removed`, `test_id_ranges` |
+| 9a | Trou coupé par minuit (40 s + 50 s) jamais « long » | Trous **fusionnés** aux changements de mois avant classement | `test_gap_split_by_month_change_is_merged` |
+| 9b | `diagnose_perp.py` et pytest divergent | Mêmes fonctions et mêmes seuils (`quality_checks.py`) ; vue brute et vue filtrée distinguées ; détail des échecs pytest par mois | — (architecture) |
+| 9c | `-m perp` n'exécute pas la couverture du perpétuel | Étiquettes de dataset sur les cas de couverture et les registres | — |
+| 9d | Versions minimales seulement, pas de provenance | `data/manifest.csv` (source, SHA256, date, mode, empreinte du code) ; `pip freeze > requirements.lock` documenté | — |
+| — | Hypothèses trop affirmatives | « Sans conséquence » retiré ; mention de l'agrégation sur 100 ms de la documentation Binance ; mécanisme exact déclaré non démontré (README, docstrings, section 5.7) | — |
+
+## Vérifications effectuées
+
+- **61 tests unitaires** passent, dont les 12 contre-exemples de la revue, transformés en tests qui échouent si la correction est retirée.
+- **Sans données**, en mode `complete` : 16 échecs de couverture. Le constat n°1 est corrigé.
+- **Sur une simulation de 3 mois** (Binance Vision simulé en local, avec journée manquante, trades exclus, minutes irréparables) : téléchargement, réparation, manifeste et registres fonctionnent de bout en bout. Les anomalies bloquent pytest tant qu'elles ne sont pas approuvées, et pytest passe une fois qu'elles le sont.
+
+## Ce qui reste à faire sur l'historique réel
+
+1. `python download_binance.py`. Les journées dont le volume diffère de la référence seront re-téléchargées.
+2. `python gaps.py`, puis `python diagnose_perp.py --register`. Toutes les anomalies existantes redeviennent **candidates**, puisque les anciens registres n'avaient pas de statut.
+3. Examiner chaque journée (`python approve.py --list`) et l'approuver avec une raison qui dit ce qui a été vérifié.
+4. `pytest`. Les nouveaux contrôles (mèches disparues, volumes par heure, échéancier du funding, close) n'ont **jamais été exécutés sur les données réelles**. Des échecs sont possibles : ils devront être analysés, et non contournés en relâchant les seuils uniformément.
+5. `pip freeze > requirements.lock` au moment de la validation.
+
+## Limites qui demeurent
+
+- La référence 1 min vient du même fournisseur que les aggTrades : une lacune commune aux deux ne serait pas vue.
+- Une concordance à la minute ne prouve pas l'exactitude seconde par seconde. Cette exactitude repose sur les tests unitaires de la reconstruction.
+- Les seuils (hors valeurs constatées pendant la séance) n'ont pas été calibrés sur l'historique complet. Il faut mesurer ce qu'ils laissent passer avant de les modifier.
+- Les tests de **causalité** des futures features, et la convention du backtest quand un stop et un objectif sont touchés dans la même seconde, restent à écrire (README, « Points d'attention »).

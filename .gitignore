@@ -2,9 +2,11 @@
 # Les données sont volumineuses (plusieurs dizaines de Go) et se régénèrent avec
 # download_binance.py : on ne les versionne pas.
 data/*
-# ... sauf le registre des trous longs : petit, et il contient les raisons saisies à la main.
+# ... sauf les fichiers de suivi : petits, et ils contiennent les décisions d'examen et la provenance.
 !data/known_gaps.csv
 !data/known_minute_mismatches.csv
+!data/manifest.csv
+!data/repair_attempts.csv
 *.parquet
 *.zip
 *.tmp

@@ -17,45 +17,65 @@ Fonctionnement
 - Stocke un fichier Parquet par mois : data/raw/<dataset>/<dataset>_<AAAA-MM>.parquet
 - Ne rajoute jamais une ligne déjà présente : les nouvelles données sont fusionnées
   avec le fichier existant et dédoublonnées sur la clé temporelle.
-- Un mois passé déjà présent sur disque n'est pas re-téléchargé (sauf --force).
+- Un mois passé déjà présent sur disque n'est pas re-téléchargé. Avec --force, il est
+  re-téléchargé et REMPLACE entièrement l'ancien contenu (utile après une correction du
+  code de reconstruction : une simple fusion garderait les anciennes valeurs).
 - Réparation des jours manquants : les fichiers mensuels de Binance Vision omettent parfois
   des journées entières. Pour chaque mois, les jours totalement absents sont recherchés dans
   les fichiers journaliers et ajoutés. Pour le perpétuel, les journées PARTIELLEMENT
   manquantes sont aussi détectées en croisant les bougies 1 s et les bougies 1 min
-  officielles (désactivable avec --no-repair).
+  officielles, ainsi que les journées dont le VOLUME diffère de la référence alors que
+  toutes les minutes sont présentes (désactivable avec --no-repair). Une journée n'est
+  remplacée par son fichier journalier que si celui-ci couvre au moins les mêmes instants.
+  Chaque tentative est notée dans data/repair_attempts.csv et n'est pas refaite aux
+  lancements suivants (sauf --retry-repairs).
 - Les ZIP sont écrits sur disque (data/_downloads/) au fil du téléchargement, puis
   supprimés une fois traités : un fichier d'aggTrades de 700 Mo ne passe jamais en mémoire.
-- Vérifie le SHA256 de chaque ZIP avec le fichier .CHECKSUM fourni par Binance.
+- Vérifie OBLIGATOIREMENT le SHA256 de chaque ZIP avec le fichier .CHECKSUM de Binance :
+  un checksum faux, vide, mal formé ou indisponible fait échouer le téléchargement
+  (--allow-missing-checksum accepte explicitement l'absence de .CHECKSUM, avec avertissement).
+- Trace la provenance de chaque fichier intégré dans data/manifest.csv : source, SHA256,
+  date de récupération, mode (fusion / remplacement) et empreinte du code de transformation.
 
 Usage
 -----
     python download_binance.py                                   # tous les datasets
     python download_binance.py --datasets futures_klines_1s      # un seul dataset
-    python download_binance.py --datasets spot_klines_1s --force # re-télécharge tout
+    python download_binance.py --datasets spot_klines_1s --force # re-télécharge et remplace tout
     python download_binance.py --no-repair                       # sans réparation des jours manquants
+    python download_binance.py --retry-repairs                   # refait les réparations déjà tentées
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import logging
+import re
 import time
 import zipfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
 import pandas as pd
 import requests
 
 BASE = "https://data.binance.vision/data"
 DATA_DIR = Path("data/raw")
 DOWNLOAD_DIR = Path("data/_downloads")
+MANIFEST = Path("data/manifest.csv")
+REPAIR_LOG = Path("data/repair_attempts.csv")
 SYMBOL = "BTCUSDT"
 START = date(2020, 1, 1)
 
 CHUNK_ROWS = 5_000_000   # lignes d'aggTrades lues à la fois (~ 1 Go de RAM au pic)
 RETRIES = 3              # tentatives par fichier en cas d'erreur réseau
+ALLOW_MISSING_CHECKSUM = False   # --allow-missing-checksum
+DAY_VOLUME_REPAIR_THRESHOLD = 0.005  # écart de volume journalier (vs 1 min officiel) qui déclenche une réparation
+
+# empreinte du code de transformation, enregistrée dans le manifeste
+CODE_SHA = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
 
 KLINE_COLS = [
     "open_time", "open", "high", "low", "close", "volume", "close_time",
@@ -72,10 +92,41 @@ session = requests.Session()
 
 # --------------------------------------------------------------------------- réseau
 
-def download(rel_path: str, dest: Path) -> bool:
+class ChecksumError(Exception):
+    """Le SHA256 d'un ZIP n'a pas pu être vérifié (faux, vide, mal formé ou indisponible)."""
+
+
+class ChecksumUnavailable(ChecksumError):
+    """Binance ne publie pas de .CHECKSUM pour ce fichier (réponse 404)."""
+
+
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def fetch_checksum(url: str) -> str | None:
     """
-    Télécharge un ZIP vers `dest` par blocs, en calculant son SHA256 au passage.
-    Renvoie False si le fichier n'existe pas sur Binance (404).
+    Renvoie le SHA256 attendu, lu dans le fichier .CHECKSUM (format « <sha256>  <nom> »).
+    None si Binance ne publie pas de .CHECKSUM (404). Toute autre anomalie lève une erreur.
+    """
+    chk = session.get(url + ".CHECKSUM", timeout=30)
+    if chk.status_code == 404:
+        return None
+    chk.raise_for_status()                      # 5xx, 403... : erreur réseau, retentée
+    parts = chk.text.split()
+    if not parts or not SHA256_RE.match(parts[0].strip().lower()):
+        raise ChecksumError(f"fichier .CHECKSUM vide ou mal formé pour {url}")
+    return parts[0].strip().lower()
+
+
+def download(rel_path: str, dest: Path) -> str | None:
+    """
+    Télécharge un ZIP vers `dest` par blocs et vérifie OBLIGATOIREMENT son SHA256.
+
+    Renvoie le SHA256 du fichier, ou None si le ZIP n'existe pas sur Binance (404).
+    Lève ChecksumError si l'empreinte est fausse ou illisible, et ChecksumUnavailable si
+    Binance ne publie pas de .CHECKSUM (sauf ALLOW_MISSING_CHECKSUM). En cas d'échec, le
+    fichier partiel est supprimé. Les erreurs réseau et les empreintes fausses sont
+    retentées RETRIES fois.
     """
     url = f"{BASE}/{rel_path}"
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -85,25 +136,34 @@ def download(rel_path: str, dest: Path) -> bool:
             sha = hashlib.sha256()
             with session.get(url, stream=True, timeout=120) as r:
                 if r.status_code == 404:
-                    return False
+                    return None
                 r.raise_for_status()
                 with open(dest, "wb") as f:
                     for block in r.iter_content(chunk_size=1 << 20):
                         f.write(block)
                         sha.update(block)
 
-            chk = session.get(url + ".CHECKSUM", timeout=30)
-            if chk.ok and chk.text.split()[0].strip().lower() != sha.hexdigest():
-                raise ValueError(f"checksum invalide pour {url}")
-            return True
+            expected = fetch_checksum(url)
+            if expected is None:
+                if not ALLOW_MISSING_CHECKSUM:
+                    raise ChecksumUnavailable(
+                        f"pas de .CHECKSUM pour {url} : relance avec --allow-missing-checksum "
+                        "pour accepter ce fichier sans vérification")
+                log.warning("%s : pas de .CHECKSUM, fichier accepté SANS vérification", rel_path)
+            elif expected != sha.hexdigest():
+                raise ChecksumError(f"checksum invalide pour {url}")
+            return sha.hexdigest()
 
-        except (requests.RequestException, ValueError) as e:
+        except ChecksumUnavailable:
+            dest.unlink(missing_ok=True)
+            raise
+        except (requests.RequestException, ChecksumError) as e:
             dest.unlink(missing_ok=True)
             if attempt == RETRIES:
                 raise
             log.warning("%s : %s, nouvelle tentative (%d/%d)", rel_path, e, attempt + 1, RETRIES)
             time.sleep(5 * attempt)
-    return False
+    return None
 
 
 # --------------------------------------------------------------------------- parsing commun
@@ -175,6 +235,55 @@ def trades_to_partial_bars(t: pd.DataFrame) -> pd.DataFrame:
     return frame.groupby("open_time", sort=True).agg(BAR_AGG)
 
 
+class AggTradeOrderError(Exception):
+    """Les identifiants d'aggTrades ne sont pas croissants : l'hypothèse d'ordre est violée."""
+
+
+class IdRanges:
+    """
+    Ensemble compact des identifiants déjà vus, stocké sous forme d'intervalles [début, fin].
+
+    Les agg_trade_id d'un fichier sont (presque) consécutifs : quelques intervalles suffisent
+    à représenter des dizaines de millions d'identifiants, là où un set Python coûterait
+    plusieurs Go.
+    """
+
+    def __init__(self) -> None:
+        self.starts = np.empty(0, dtype=np.int64)
+        self.ends = np.empty(0, dtype=np.int64)
+
+    def contains(self, ids: np.ndarray) -> np.ndarray:
+        if not len(self.starts):
+            return np.zeros(len(ids), dtype=bool)
+        pos = np.searchsorted(self.starts, ids, side="right") - 1
+        ok = pos >= 0
+        res = np.zeros(len(ids), dtype=bool)
+        res[ok] = ids[ok] <= self.ends[pos[ok]]
+        return res
+
+    def add(self, ids: np.ndarray) -> None:
+        """Ajoute des identifiants triés, uniques."""
+        if not len(ids):
+            return
+        breaks = np.flatnonzero(np.diff(ids) != 1)
+        starts = np.concatenate([ids[:1], ids[breaks + 1]])
+        ends = np.concatenate([ids[breaks], ids[-1:]])
+        s = np.concatenate([self.starts, starts])
+        e = np.concatenate([self.ends, ends])
+        order = np.argsort(s, kind="stable")
+        s, e = s[order], e[order]
+        # fusion des intervalles contigus ou chevauchants
+        merged_s, merged_e = [s[0]], [e[0]]
+        for a, b in zip(s[1:], e[1:]):
+            if a <= merged_e[-1] + 1:
+                merged_e[-1] = max(merged_e[-1], b)
+            else:
+                merged_s.append(a)
+                merged_e.append(b)
+        self.starts = np.array(merged_s, dtype=np.int64)
+        self.ends = np.array(merged_e, dtype=np.int64)
+
+
 def build_bars_from_aggtrades(zip_path: Path, spec: dict) -> pd.DataFrame:
     """
     Reconstruit les bougies 1 s d'un fichier d'aggTrades, en le lisant par morceaux.
@@ -183,29 +292,52 @@ def build_bars_from_aggtrades(zip_path: Path, spec: dict) -> pd.DataFrame:
     ré-agrégées à la fin avec les mêmes règles (first / max / min / last / sum). Comme les
     morceaux sont lus dans l'ordre, « first » et « last » restent corrects.
 
+    Hypothèse d'ordre, VÉRIFIÉE : open et close reposent sur l'ordre du fichier. Une fois
+    les doublons retirés, les agg_trade_id doivent être strictement croissants. Un
+    identifiant jamais vu mais inférieur au plus grand déjà lu viole cette hypothèse et
+    lève AggTradeOrderError, au lieu d'être supprimé silencieusement.
+
     Dédoublonnage : certains fichiers de Binance Vision contiennent des aggTrades en double
-    (constaté les 12 et 13/09/2022, où le volume était exactement doublé). Chaque aggTrade a
-    un identifiant unique (agg_trade_id), croissant dans le fichier. On ne garde donc que
-    la première occurrence de chaque identifiant, y compris quand le doublon se trouve dans
-    un morceau ultérieur (identifiant inférieur ou égal au plus grand déjà vu).
+    (constaté les 12 et 13/09/2022, où le volume était exactement doublé). Un identifiant
+    déjà vu, dans le même morceau ou dans un morceau précédent, est ignoré. Les
+    identifiants vus sont conservés sous forme d'intervalles (IdRanges).
     """
     skip = 1 if has_header(zip_path) else 0
     parts = []
+    seen = IdRanges()
     max_seen = -1
     dropped = 0
+    last_time = None
+    time_disorder = 0
     with zipfile.ZipFile(zip_path) as z, z.open(z.namelist()[0]) as f:
         reader = pd.read_csv(f, header=None, names=AGG_TRADE_COLS, skiprows=skip, chunksize=CHUNK_ROWS)
         for chunk in reader:
-            ids = pd.to_numeric(chunk["agg_trade_id"])
-            keep = ~ids.duplicated() & (ids > max_seen)
-            dropped += int((~keep).sum())
-            chunk = chunk[keep.values]
+            ids = pd.to_numeric(chunk["agg_trade_id"]).to_numpy(dtype=np.int64)
+            dup = pd.Series(ids).duplicated().to_numpy() | seen.contains(ids)
+            dropped += int(dup.sum())
+            new_ids = ids[~dup]
+            if len(new_ids):
+                sequence = np.concatenate([[max_seen], new_ids])
+                if not (np.diff(sequence) > 0).all():
+                    bad = new_ids[np.flatnonzero(np.diff(sequence) <= 0)[0]]
+                    raise AggTradeOrderError(
+                        f"{zip_path.name} : identifiant d'aggTrade {bad} inédit mais hors ordre "
+                        f"(plus grand identifiant déjà lu : {max(max_seen, int(new_ids.max()))}). "
+                        "L'ordre du fichier ne peut pas servir à déterminer open / close.")
+                max_seen = int(new_ids[-1])
+                seen.add(new_ids)
+            chunk = chunk[~dup]
             if chunk.empty:
                 continue
-            max_seen = max(max_seen, int(ids[keep].max()))
+            times = pd.to_numeric(chunk["transact_time"]).to_numpy()
+            seq_t = times if last_time is None else np.concatenate([[last_time], times])
+            time_disorder += int((np.diff(seq_t) < 0).sum())
+            last_time = times[-1]
             parts.append(trades_to_partial_bars(chunk))
     if dropped:
         log.warning("%s : %d aggTrades en double ignorés", zip_path.name, dropped)
+    if time_disorder:
+        log.warning("%s : %d horodatages en recul malgré des identifiants croissants", zip_path.name, time_disorder)
 
     bars = pd.concat(parts).groupby(level=0, sort=True).agg(BAR_AGG).reset_index()
     bars["close_time"] = bars["open_time"] + pd.Timedelta(milliseconds=999)
@@ -264,12 +396,50 @@ def merge_into(path: Path, new: pd.DataFrame, key: str) -> int:
     else:
         combined = new
 
-    combined = combined.sort_values(key).reset_index(drop=True)
+    # écriture atomique : pas de fichier corrompu si le script est interrompu
+    write_atomic(path, combined.sort_values(key).reset_index(drop=True))
+    return len(new)
+
+
+def write_atomic(path: Path, df: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    combined.to_parquet(tmp, index=False)
-    tmp.replace(path)  # écriture atomique : pas de fichier corrompu si le script est interrompu
+    df.to_parquet(tmp, index=False)
+    tmp.replace(path)
+
+
+def replace_range(path: Path, new: pd.DataFrame, key: str,
+                  start: pd.Timestamp, end: pd.Timestamp) -> int:
+    """
+    Remplace, dans `path`, toutes les lignes dont la clé est dans [start, end[ par `new`.
+
+    Pourquoi : merge_into n'ajoute que des lignes absentes. Après une correction du code de
+    reconstruction, ou pour compléter une seconde partiellement reconstruite, il faut au
+    contraire REMPLACER les anciennes valeurs. On remplace une plage entière, sans jamais
+    additionner deux bougies de la même seconde (ce qui recompterait les mêmes trades).
+    L'écriture est atomique. Renvoie le nombre de lignes écrites dans la plage.
+    """
+    new = new.drop_duplicates(subset=key)
+    new = new[(new[key] >= start) & (new[key] < end)]
+    if path.exists():
+        old = pd.read_parquet(path)
+        old = old[(old[key] < start) | (old[key] >= end)]
+        combined = pd.concat([old, new], ignore_index=True)
+    else:
+        combined = new
+    write_atomic(path, combined.sort_values(key).reset_index(drop=True))
     return len(new)
+
+
+def record_manifest(dataset: str, target: Path, source: str, sha: str, mode: str, rows: int) -> None:
+    """Ajoute une ligne de provenance dans data/manifest.csv."""
+    row = pd.DataFrame([{
+        "retrieved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "dataset": dataset, "target": target.name, "source": f"{BASE}/{source}",
+        "sha256": sha, "mode": mode, "rows": rows, "code_sha": CODE_SHA,
+    }])
+    MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    row.to_csv(MANIFEST, mode="a", header=not MANIFEST.exists(), index=False)
 
 
 def days_present(path: Path, key: str) -> set[date]:
@@ -288,18 +458,60 @@ def month_starts(start: date, end_exclusive: date):
         d = (d.replace(day=28) + timedelta(days=4)).replace(day=1)
 
 
-def fetch_and_store(rel_path: str, out: Path, spec: dict, label: str) -> None:
-    """Télécharge un ZIP, le transforme avec le builder du dataset, fusionne, supprime le ZIP."""
+def dataset_of(out: Path) -> str:
+    return out.parent.name
+
+
+def fetch_and_store(rel_path: str, out: Path, spec: dict, label: str, mode: str = "merge",
+                    period: tuple[pd.Timestamp, pd.Timestamp] | None = None) -> pd.DataFrame | None:
+    """
+    Télécharge un ZIP, le transforme avec le builder du dataset, l'intègre, supprime le ZIP.
+
+    mode = "merge"   : ajoute les lignes absentes (comportement par défaut) ;
+    mode = "replace" : remplace toutes les lignes de `period` par le nouveau contenu ;
+    mode = "replace_if_superset" : remplace `period` seulement si le nouveau contenu couvre
+                       au moins tous les instants déjà présents, sinon fusionne.
+    Renvoie le DataFrame obtenu (None si le fichier n'existe pas chez Binance).
+    """
     zip_path = DOWNLOAD_DIR / Path(rel_path).name
     try:
-        if not download(rel_path, zip_path):
+        sha = download(rel_path, zip_path)
+        if sha is None:
             log.info("%s : indisponible sur Binance Vision", label)
-            return
+            return None
         builder: Callable[[Path, dict], pd.DataFrame] = spec["builder"]
-        added = merge_into(out, builder(zip_path, spec), spec["key"])
-        log.info("%s : %d lignes ajoutées", label, added)
+        new = builder(zip_path, spec)
+        key = spec["key"]
+
+        if mode == "replace_if_superset" and out.exists():
+            old_keys = pd.read_parquet(out, columns=[key])[key]
+            old_keys = old_keys[(old_keys >= period[0]) & (old_keys < period[1])]
+            mode = "replace" if old_keys.isin(new[key]).all() else "merge"
+            if mode == "merge":
+                log.warning("%s : le fichier journalier ne couvre pas tout l'existant, simple fusion", label)
+        elif mode == "replace_if_superset":
+            mode = "replace"
+
+        if mode == "replace":
+            rows = replace_range(out, new, key, *period)
+            log.info("%s : %d lignes (plage remplacée)", label, rows)
+        else:
+            rows = merge_into(out, new, key)
+            log.info("%s : %d lignes ajoutées", label, rows)
+        record_manifest(dataset_of(out), out, rel_path, sha, mode, rows)
+        return new
     finally:
         zip_path.unlink(missing_ok=True)
+
+
+def month_bounds(m: date) -> tuple[pd.Timestamp, pd.Timestamp]:
+    start = pd.Timestamp(m, tz="UTC")
+    return start, start + pd.offsets.MonthBegin(1)
+
+
+def day_bounds(d: date) -> tuple[pd.Timestamp, pd.Timestamp]:
+    start = pd.Timestamp(d, tz="UTC")
+    return start, start + pd.Timedelta(days=1)
 
 
 def fill_missing_days(name: str, spec: dict, out: Path, first_day: date, end_day: date) -> None:
@@ -315,7 +527,8 @@ def fill_missing_days(name: str, spec: dict, out: Path, first_day: date, end_day
     d = first_day
     while d < end_day:
         if d not in already:
-            fetch_and_store(spec["daily"].format(period=d.isoformat()), out, spec, f"{name} {d}")
+            fetch_and_store(spec["daily"].format(period=d.isoformat()), out, spec, f"{name} {d}",
+                            mode="replace", period=day_bounds(d))
         d += timedelta(days=1)
 
 
@@ -331,7 +544,9 @@ def sync_dataset(name: str, spec: dict, force: bool = False, repair: bool = True
         if out.exists() and not force:
             log.debug("%s %s déjà présent, ignoré", name, period)
         else:
-            fetch_and_store(spec["monthly"].format(period=period), out, spec, f"{name} {period}")
+            # --force : le nouveau contenu REMPLACE le mois entier
+            fetch_and_store(spec["monthly"].format(period=period), out, spec, f"{name} {period}",
+                            mode="replace" if force else "merge", period=month_bounds(m))
 
         # on ne répare que les mois dont Binance a publié au moins une partie
         if repair and spec["daily"] is not None and out.exists():
@@ -345,39 +560,87 @@ def sync_dataset(name: str, spec: dict, force: bool = False, repair: bool = True
     fill_missing_days(name, spec, out, current_month, today)
 
 
-def repair_perp_partial_days() -> None:
+def load_repair_log() -> set[tuple[str, str]]:
+    if not REPAIR_LOG.exists():
+        return set()
+    df = pd.read_csv(REPAIR_LOG, dtype=str)
+    return set(zip(df["dataset"], df["day"]))
+
+
+def log_repair(dataset: str, d: date, reason: str, rows: int | None) -> None:
+    row = pd.DataFrame([{
+        "attempted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "dataset": dataset, "day": d.isoformat(), "reason": reason,
+        "result": "indisponible" if rows is None else f"{rows} lignes",
+    }])
+    REPAIR_LOG.parent.mkdir(parents=True, exist_ok=True)
+    row.to_csv(REPAIR_LOG, mode="a", header=not REPAIR_LOG.exists(), index=False)
+
+
+def perp_day_discrepancies(path_1s: Path, path_1m: Path) -> dict[str, dict[date, str]]:
     """
-    Répare les journées PARTIELLEMENT manquantes du perpétuel, en croisant les bougies 1 s
-    reconstruites et les bougies 1 min officielles.
+    Journées du perpétuel à réparer, par dataset, avec la raison :
+    - minutes officielles absentes chez nous       -> futures_klines_1s
+    - minutes à nous absentes des bougies officielles -> futures_klines_1m
+    - volume journalier différent de plus de DAY_VOLUME_REPAIR_THRESHOLD alors que les
+      minutes sont présentes (journée amputée en contenu) -> les deux datasets
+    """
+    s = pd.read_parquet(path_1s, columns=["open_time", "volume"])
+    m = pd.read_parquet(path_1m, columns=["open_time", "volume"])
+    m = m[m["volume"] > 0]
+    ours = pd.DatetimeIndex(s["open_time"].dt.floor("min").unique())
+    off = pd.DatetimeIndex(m["open_time"].unique())
+
+    todo: dict[str, dict[date, str]] = {"futures_klines_1s": {}, "futures_klines_1m": {}}
+    for d in set(off.difference(ours).date):
+        todo["futures_klines_1s"][d] = "minutes officielles absentes chez nous"
+    for d in set(ours.difference(off).date):
+        todo["futures_klines_1m"][d] = "minutes absentes des bougies officielles"
+
+    vs = s.groupby(s["open_time"].dt.date)["volume"].sum()
+    vm = m.groupby(m["open_time"].dt.date)["volume"].sum()
+    common = vs.index.intersection(vm.index)
+    rel = (vs[common] / vm[common] - 1).abs()
+    for d in rel[rel > DAY_VOLUME_REPAIR_THRESHOLD].index:
+        for ds in todo:
+            todo[ds].setdefault(d, f"volume journalier différent de {rel[d]:.2%}")
+    return todo
+
+
+def repair_perp_partial_days(retry: bool = False) -> None:
+    """
+    Répare les journées du perpétuel incomplètes, en croisant les bougies 1 s reconstruites
+    et les bougies 1 min officielles.
 
     Pourquoi : certains fichiers mensuels de Binance Vision sont tronqués au milieu d'une
-    journée (par exemple le 13/04/2020 à partir de 00:32). fill_missing_days ne voit que les
-    journées totalement vides. Ici, pour chaque jour :
-    - s'il manque chez nous des minutes présentes dans les bougies officielles, on
-      re-télécharge le fichier journalier d'aggTrades de ce jour ;
-    - s'il manque dans les bougies officielles des minutes présentes chez nous, c'est le
-      fichier officiel qui est tronqué : on re-télécharge le fichier journalier 1 min.
-    La fusion ne rajoute que les lignes absentes. Si le fichier journalier est lui aussi
-    incomplet, rien ne change et les tests de vérification continueront de le signaler.
+    journée (par exemple le 13/04/2020 à partir de 00:32), ou amputés en contenu sans qu'une
+    minute disparaisse. fill_missing_days ne voit que les journées totalement vides. Ici,
+    chaque journée signalée par perp_day_discrepancies est re-téléchargée depuis son fichier
+    journalier. Le contenu du jour est REMPLACÉ si le fichier journalier couvre au moins les
+    mêmes instants (sinon simple fusion), pour compléter aussi les secondes partielles.
+
+    Chaque tentative est notée dans data/repair_attempts.csv et n'est pas refaite aux
+    lancements suivants, sauf retry=True. Si le fichier journalier est lui aussi
+    incomplet, les tests de vérification continueront de signaler la journée.
     """
-    spec_1s, spec_1m = DATASETS["futures_klines_1s"], DATASETS["futures_klines_1m"]
-    dir_1s, dir_1m = DATA_DIR / "futures_klines_1s", DATA_DIR / "futures_klines_1m"
-    for path_1s in sorted(dir_1s.glob("futures_klines_1s_*.parquet")):
+    attempted = set() if retry else load_repair_log()
+    dirs = {ds: DATA_DIR / ds for ds in ("futures_klines_1s", "futures_klines_1m")}
+    for path_1s in sorted(dirs["futures_klines_1s"].glob("futures_klines_1s_*.parquet")):
         period = path_1s.stem.rsplit("_", 1)[-1]
-        path_1m = dir_1m / f"futures_klines_1m_{period}.parquet"
+        path_1m = dirs["futures_klines_1m"] / f"futures_klines_1m_{period}.parquet"
         if not path_1m.exists():
             continue
-        ours = pd.read_parquet(path_1s, columns=["open_time"])["open_time"].dt.floor("min").unique()
-        off = pd.read_parquet(path_1m, columns=["open_time", "volume"])
-        off = off.loc[off["volume"] > 0, "open_time"].unique()
-        ours, off = pd.DatetimeIndex(ours), pd.DatetimeIndex(off)
-
-        for d in sorted(set(off.difference(ours).date)):
-            log.info("futures_klines_1s %s : journée incomplète, nouvelle tentative avec le fichier journalier", d)
-            fetch_and_store(spec_1s["daily"].format(period=d.isoformat()), path_1s, spec_1s, f"futures_klines_1s {d}")
-        for d in sorted(set(ours.difference(off).date)):
-            log.info("futures_klines_1m %s : bougies officielles incomplètes, nouvelle tentative", d)
-            fetch_and_store(spec_1m["daily"].format(period=d.isoformat()), path_1m, spec_1m, f"futures_klines_1m {d}")
+        targets = {"futures_klines_1s": path_1s, "futures_klines_1m": path_1m}
+        for ds, days in perp_day_discrepancies(path_1s, path_1m).items():
+            spec = DATASETS[ds]
+            for d, reason in sorted(days.items()):
+                if (ds, d.isoformat()) in attempted:
+                    log.debug("%s %s : réparation déjà tentée, ignorée", ds, d)
+                    continue
+                log.info("%s %s : %s, nouvelle tentative avec le fichier journalier", ds, d, reason)
+                new = fetch_and_store(spec["daily"].format(period=d.isoformat()), targets[ds], spec,
+                                      f"{ds} {d}", mode="replace_if_superset", period=day_bounds(d))
+                log_repair(ds, d, reason, None if new is None else len(new))
 
 
 def main() -> None:
@@ -386,8 +649,15 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="re-télécharge les mois déjà présents")
     parser.add_argument("--no-repair", action="store_true",
                         help="ne cherche pas les jours manquants dans les fichiers journaliers")
+    parser.add_argument("--retry-repairs", action="store_true",
+                        help="refait les réparations déjà tentées (data/repair_attempts.csv)")
+    parser.add_argument("--allow-missing-checksum", action="store_true",
+                        help="accepte, avec avertissement, les fichiers sans .CHECKSUM chez Binance")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
+
+    global ALLOW_MISSING_CHECKSUM
+    ALLOW_MISSING_CHECKSUM = args.allow_missing_checksum
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -398,7 +668,7 @@ def main() -> None:
 
     # réparation croisée des journées partiellement manquantes du perpétuel
     if not args.no_repair and {"futures_klines_1s", "futures_klines_1m"} & set(args.datasets):
-        repair_perp_partial_days()
+        repair_perp_partial_days(retry=args.retry_repairs)
 
 
 if __name__ == "__main__":

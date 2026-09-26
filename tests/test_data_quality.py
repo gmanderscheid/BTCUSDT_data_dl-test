@@ -1,5 +1,5 @@
 """
-Tests de qualité des données téléchargées par download_binance.py.
+Tests de qualité des DONNÉES téléchargées par download_binance.py.
 
 Pourquoi tester des données ?
 -----------------------------
@@ -12,127 +12,125 @@ un modèle qui semble excellent en backtest et qui perd de l'argent en réel. Pa
 - un trou de 3 h comblé naïvement fait croire à un marché immobile ;
 - une bougie rangée dans le mauvais mois fausse le découpage train / test.
 
-Ces tests sont donc la première barrière entre les fichiers bruts et les modèles.
-À relancer après chaque téléchargement.
+Ces tests sont la première barrière entre les fichiers bruts et les modèles. Ils ne
+remplacent pas une revue : ils vérifient des contrats précis, énoncés dans chaque
+docstring. Un pytest vert signifie « tous les contrats énoncés sont respectés sur les
+données présentes », et le contrat de couverture (data_contract.py) garantit que les
+données présentes sont bien celles attendues.
+
+Les contrôles eux-mêmes sont dans quality_checks.py. Leur capacité à détecter les
+défauts est vérifiée par les tests unitaires de tests/test_pipeline.py (cas synthétiques
+positifs et négatifs).
 
 Lancement (depuis la racine du projet)
 --------------------------------------
-    pytest                          # tous les tests
-    pytest -k gaps                  # seulement les tests sur les trous
+    pytest                          # tests unitaires + tests de données
+    pytest -m unit                  # tests unitaires seulement (rapides, sans données)
+    pytest -m "not unit"            # tests de données seulement
     pytest -k "2020-06"             # seulement un mois
-    pytest -x -q                    # s'arrête au premier échec
+    pytest --lf                     # seulement ce qui a échoué la dernière fois
 
-Avant le premier lancement, générer le registre des trous longs :
-    python gaps.py
+Avant le premier lancement : `python gaps.py`, `python diagnose_perp.py --register`, puis
+examiner et approuver les exceptions (`python approve.py --list`).
 
-Lancer par catégorie (option -m)
---------------------------------
-Chaque test porte une étiquette de catégorie et une étiquette de dataset. `-m` sélectionne
-les tests par étiquette, `-k` par nom de test ou de fichier. Les deux se combinent.
+Catégories (option -m)
+----------------------
+    structure       fichier non vide, colonnes, types, valeurs finies, n_trades entier, pas de .tmp
+    chronologie     doublons, tri, bon mois, alignement, durée des bougies (y compris entre deux mois)
+    completude      contrat de couverture (datasets, premier / dernier mois, mois manquants,
+                    fraîcheur, référence 1 min), trous courts / longs, échéancier du funding
+    coherence       prix positifs, OHLC, sauts de prix, ordre de grandeur du funding
+    volumes         volumes positifs, acheteur <= total, nuls cohérents, VWAP et VWAP acheteur
+    registre        structure des deux registres, exceptions examinées, pas d'exception obsolète
+    verification    perpétuel 1 s comparé aux bougies 1 min officielles
+    unit            tests unitaires du pipeline et des contrôles (tests/test_pipeline.py)
 
-    Catégorie       Ce qu'elle vérifie                                    Quand la relancer
-    -------------   ---------------------------------------------------   ------------------------------------------
-    structure       fichier non vide, colonnes, types, pas de NaN,        après une modification de download_binance.py
-                    fichiers .tmp restants                                 ou un changement de format chez Binance
-    chronologie     doublons, tri, bon mois, alignement, close_time       après une modification du parsing des dates
-                                                                           ou de la fusion (merge_into)
-    completude      trous courts / longs, mois manquants, fraîcheur,      après un (re)téléchargement ou après
-                    régularité du funding, registre                        `python gaps.py`
-    coherence       prix positifs, OHLC, sauts de prix,                   après un (re)téléchargement de fichiers
-                    bornes du funding
-    volumes         volumes positifs, volume acheteur <= total,           après un (re)téléchargement de fichiers
-                    trades => volume, VWAP entre low et high
-    registre        known_gaps.csv bien formé (aussi dans completude)     après avoir édité known_gaps.csv à la main
-    verification    bougies 1 s du perpétuel agrégées en 1 min,           après une modification de la reconstruction
-                    comparées aux bougies 1 min officielles de Binance     (build_bars_from_aggtrades) ou un
-                                                                           (re)téléchargement du perpétuel
-
-    Dataset         klines   bougies 1 s (spot et perpétuel)
-                    spot     bougies 1 s du spot uniquement
-                    perp     bougies 1 s du perpétuel uniquement (et leur vérification)
-                    funding  funding rate du perpétuel
+    Dataset         klines (1 s, spot et perpétuel), spot, perp (1 s + référence 1 min),
+                    reference (bougies 1 min officielles), funding
 
 Exemples :
-    pytest -m completude                        # une seule catégorie
     pytest -m "completude or chronologie"       # plusieurs catégories
-    pytest -m "not completude"                  # tout sauf une catégorie
-    pytest -m funding                           # un seul dataset
-    pytest -m "klines and coherence"            # une catégorie sur un dataset
-    pytest -m "perp and completude"             # une catégorie sur le perpétuel seulement
-    pytest -m completude -k "2021-04"           # une catégorie sur un seul mois
-    pytest --lf                                 # seulement les tests qui ont échoué la dernière fois
-    pytest --markers                            # liste des étiquettes disponibles
+    pytest -m "perp and verification"           # une catégorie sur un marché
+    pytest -m registre                          # après une approbation dans un registre
 
-Scénarios courants :
-    - Un mois a été re-téléchargé      -> pytest -k "2021-04"
-    - Le registre a été régénéré       -> pytest -m "completude or registre"
-    - known_gaps.csv édité à la main   -> pytest -m registre
-    - Le parsing a été modifié         -> pytest -m "structure or chronologie"
-    - La reconstruction 1 s a changé   -> pytest -m verification
-    - Vérification complète            -> pytest
-
-Seuls les fichiers Parquet utilisés par les tests sélectionnés sont lus : une sélection
-étroite est donc aussi beaucoup plus rapide.
-
-Variables d'environnement optionnelles
---------------------------------------
-    BINANCE_DATA_DIR            dossier des données (défaut : data/raw)
-    KNOWN_GAPS_FILE             registre des trous longs (défaut : data/known_gaps.csv)
-    SHORT_GAP_MAX_SECONDS       durée max d'un trou « court » (défaut : 60)
-    MAX_SHORT_GAP_RATIO         part max de secondes manquantes en trous courts, spot (défaut : 0.005)
-    MAX_SHORT_GAP_RATIO_PERP    idem pour le perpétuel (défaut : 0.60, simple garde-fou)
-    MAX_VOLUME_DEFICIT          volume manquant max par rapport aux bougies 1 min officielles (défaut : 0.01)
-    MAX_PRICE_JUMP              variation de prix max en 1 s, spot (défaut : 0.10 = 10 %)
-    MAX_PRICE_JUMP_PERP         idem pour le perpétuel (défaut : 0.15 = 15 %)
-    MAX_VOLUME_DRIFT            dérive max du volume cumulé vs officiel, en part du volume du mois (défaut : 0.001)
-    MAX_PRICE_EXCESS            dépassement toléré des prix extrêmes officiels voisins (défaut : 0.0005 = 0,05 %)
+Seuils (variables d'environnement)
+----------------------------------
+    VALIDATION_MODE             complete (défaut) ou partial (exploration, NE VAUT PAS validation)
+    SHORT_GAP_MAX_SECONDS       durée max d'un trou « court » (60)
+    MAX_SHORT_GAP_RATIO         part max de secondes en trous courts, spot (0.005)
+    MAX_SHORT_GAP_RATIO_PERP    idem perpétuel, simple garde-fou (0.60)
+    MAX_PRICE_JUMP              variation simple max du close en 1 s, spot (0.10)
+    MAX_PRICE_JUMP_PERP         idem perpétuel (0.15)
+    MAX_VWAP_TOL                marge du VWAP hors [low, high] (0.001)
+    MAX_PRICE_EXCESS            écart toléré aux extrêmes officiels voisins (0.0005)
+    MAX_CLOSE_MISMATCH          part max de minutes au close différent de l'officiel (0.005)
+    MAX_VOLUME_DRIFT            dérive max du volume cumulé, part du volume du mois (0.001)
+    MAX_DAY_VOLUME_GAP          écart max de volume par jour (0.005)
+    MAX_HOUR_VOLUME_GAP         écart max de volume par heure (0.05) ...
+    HOUR_VOLUME_FLOOR           ... ou, si plus grand, ce nombre de BTC (100)
+    MAX_VOLUME_DEFICIT          écart max du volume du mois, minutes communes (0.01)
+    MIN_COMPARED_SHARE          part min des minutes officielles comparées (0.99)
+    MAX_EXCLUDED_VOLUME_SHARE   part max du volume officiel exclu par le registre (0.005)
+    MAX_FUNDING_ABS / MAX_FUNDING_MEDIAN   bornes du funding rate (0.03 / 0.001)
 
 Le vocabulaire financier (kline, spot, funding, taker…) est défini dans GLOSSAIRE.md.
 """
 from __future__ import annotations
 
-import os
 import warnings
 from datetime import date, timedelta
 
-import numpy as np
 import pandas as pd
 import pytest
 
+import data_contract as contract
+import quality_checks as qc
 from download_binance import DATASETS
 from gaps import (
-    SECOND_DATASETS, SHORT_GAP_MAX_SECONDS, data_dir, expected_range, files_of, find_gaps,
-    known_gaps_path, known_mismatches_path, load_known_gaps, load_known_mismatches, month_of,
-    next_month, split_gaps, utc,
+    SECOND_DATASETS, SHORT_GAP_MAX_SECONDS, STATUSES, approved, data_dir, dataset_gaps,
+    detected_long_gaps, files_of, gaps_overlapping, known_gaps_path, known_mismatches_path,
+    load_known_gaps, load_known_mismatches, month_of, next_month, split_gaps, utc,
 )
 
 DATA = data_dir()
-# Part max de secondes manquantes en trous courts, par marché. Le perpétuel a naturellement
-# beaucoup plus de secondes sans trade que le spot (jusqu'à ~45 % en 2020) : sa complétude
-# réelle est vérifiée par la catégorie `verification`, ce seuil n'est qu'un garde-fou.
-MAX_SHORT_GAP_RATIO = {
-    "spot_klines_1s": float(os.environ.get("MAX_SHORT_GAP_RATIO", "0.005")),
-    "futures_klines_1s": float(os.environ.get("MAX_SHORT_GAP_RATIO_PERP", "0.60")),
-}
-# Vérification du perpétuel contre les bougies 1 min officielles (voir TestPerpetualVsOfficial1m)
-MAX_VOLUME_DEFICIT = float(os.environ.get("MAX_VOLUME_DEFICIT", "0.01"))
-MAX_VOLUME_DRIFT = float(os.environ.get("MAX_VOLUME_DRIFT", "0.001"))
-MAX_PRICE_EXCESS = float(os.environ.get("MAX_PRICE_EXCESS", "0.0005"))
-# Saut de prix max en 1 s, par marché. Le perpétuel connaît de vraies mèches plus violentes
-# que le spot lors des cascades de liquidations (+12 % en 1 s le 18/04/2021, confirmé par
-# la bougie 1 min officielle).
-MAX_PRICE_JUMP = {
-    "spot_klines_1s": float(os.environ.get("MAX_PRICE_JUMP", "0.10")),
-    "futures_klines_1s": float(os.environ.get("MAX_PRICE_JUMP_PERP", "0.15")),
-}
+
+
+T = qc.THRESHOLDS   # seuils partagés avec diagnose_perp.py (quality_checks.py)
+MAX_SHORT_GAP_RATIO = {"spot_klines_1s": T["MAX_SHORT_GAP_RATIO"], "futures_klines_1s": T["MAX_SHORT_GAP_RATIO_PERP"]}
+MAX_PRICE_JUMP = {"spot_klines_1s": T["MAX_PRICE_JUMP"], "futures_klines_1s": T["MAX_PRICE_JUMP_PERP"]}
+MAX_VWAP_TOL = T["MAX_VWAP_TOL"]
+MAX_PRICE_EXCESS = T["MAX_PRICE_EXCESS"]
+MAX_CLOSE_MISMATCH = T["MAX_CLOSE_MISMATCH"]
+MAX_VOLUME_DRIFT = T["MAX_VOLUME_DRIFT"]
+MAX_DAY_VOLUME_GAP = T["MAX_DAY_VOLUME_GAP"]
+MAX_HOUR_VOLUME_GAP = T["MAX_HOUR_VOLUME_GAP"]
+HOUR_VOLUME_FLOOR = T["HOUR_VOLUME_FLOOR"]
+MAX_VOLUME_DEFICIT = T["MAX_VOLUME_DEFICIT"]
+MAX_FUNDING_ABS = T["MAX_FUNDING_ABS"]
+MAX_FUNDING_MEDIAN = T["MAX_FUNDING_MEDIAN"]
 
 EXPECTED_KLINE_COLS = [c for c in DATASETS["spot_klines_1s"]["columns"] if c != "ignore"]
+NUMERIC_KLINE_COLS = [c for c in EXPECTED_KLINE_COLS if c not in ("open_time", "close_time")]
 
-# étiquette de marché ajoutée à chaque fichier : `pytest -m spot` ou `pytest -m perp`
-MARKET_MARK = {"spot_klines_1s": pytest.mark.spot, "futures_klines_1s": pytest.mark.perp}
+DATASET_MARKS = {
+    "spot_klines_1s": [pytest.mark.spot, pytest.mark.klines],
+    "futures_klines_1s": [pytest.mark.perp, pytest.mark.klines],
+    "futures_klines_1m": [pytest.mark.perp, pytest.mark.reference],
+    "futures_funding": [pytest.mark.funding],
+}
 
 
 # --------------------------------------------------------------------------- utilitaires
+
+def dataset_of(path) -> str:
+    """Nom du dataset d'un fichier : le nom de son dossier."""
+    return path.parent.name
+
+
+def month_range(path) -> tuple[pd.Timestamp, pd.Timestamp]:
+    m = month_of(path)
+    return utc(m), utc(next_month(m))
+
 
 def describe_gaps(gaps: pd.DataFrame, top: int = 10) -> str:
     """Texte lisible listant les trous les plus longs, pour les messages d'erreur."""
@@ -143,30 +141,22 @@ def describe_gaps(gaps: pd.DataFrame, top: int = 10) -> str:
 
 
 def params_for(*datasets: str):
-    """Un paramètre pytest par fichier mensuel, étiqueté avec son marché (spot / perp)."""
+    """Un paramètre pytest par fichier mensuel, étiqueté avec son dataset."""
     params = []
     for dataset in datasets:
-        mark = MARKET_MARK.get(dataset)
-        marks = [mark] if mark else []
+        marks = DATASET_MARKS.get(dataset, [])
         params += [pytest.param(p, id=p.stem, marks=marks) for p in files_of(dataset, DATA)]
     if not params:
         return [pytest.param(None, marks=pytest.mark.skip(reason=f"aucun fichier pour {', '.join(datasets)}"))]
     return params
 
 
-def dataset_of(path) -> str:
-    """Nom du dataset d'un fichier : le nom de son dossier."""
-    return path.parent.name
+def dataset_params(*datasets: str):
+    return [pytest.param(d, id=d, marks=DATASET_MARKS.get(d, [])) for d in datasets]
 
 
-def months_in_both(a: str, b: str):
-    """Mois présents à la fois dans les datasets a et b (pour les comparaisons croisées)."""
-    fa = {month_of(p): p for p in files_of(a, DATA)}
-    fb = {month_of(p): p for p in files_of(b, DATA)}
-    common = sorted(fa.keys() & fb.keys())
-    if not common:
-        return [pytest.param(None, marks=pytest.mark.skip(reason=f"aucun mois commun entre {a} et {b}"))]
-    return [pytest.param((fa[m], fb[m]), id=f"{m:%Y-%m}") for m in common]
+def assert_no_errors(name: str, errors: list[str]) -> None:
+    assert not errors, f"{name}\n" + "\n".join(errors)
 
 
 # --------------------------------------------------------------------------- fixtures
@@ -175,25 +165,38 @@ def months_in_both(a: str, b: str):
 
 @pytest.fixture(scope="module", params=params_for(*SECOND_DATASETS))
 def klines(request):
-    """(chemin, DataFrame) d'un fichier mensuel de klines 1s (spot ou perpétuel)."""
+    """(chemin, DataFrame) d'un fichier mensuel de bougies 1 s (spot ou perpétuel)."""
     return request.param, pd.read_parquet(request.param)
 
 
 @pytest.fixture(scope="module")
 def kline_gaps(klines):
-    """Trous (courts et longs) du fichier courant, calculés une seule fois par fichier."""
-    path, df = klines
-    first = files_of(dataset_of(path), DATA)[0]
-    start, end = expected_range(path, df, is_first_file=(path == first))
-    gaps = find_gaps(df["open_time"], start, end)
+    """
+    Trous (courts et longs) qui touchent le mois du fichier, calculés sur tout le dataset
+    puis fusionnés aux changements de mois : un trou coupé par minuit en fin de mois est
+    classé selon sa durée totale.
+    """
+    path, _ = klines
+    start, end = month_range(path)
+    gaps = gaps_overlapping(dataset_gaps(dataset_of(path), str(DATA)), start, end)
     short, long_ = split_gaps(gaps, SHORT_GAP_MAX_SECONDS)
-    n_expected = int((end - start) / pd.Timedelta(seconds=1))
-    return short, long_, n_expected
+    return short, long_
 
 
 @pytest.fixture(scope="module")
 def known_gaps():
     return load_known_gaps(known_gaps_path())
+
+
+@pytest.fixture(scope="module")
+def known_mismatches():
+    return load_known_mismatches(known_mismatches_path())
+
+
+@pytest.fixture(scope="module", params=params_for("futures_klines_1m"))
+def reference_1m(request):
+    """(chemin, DataFrame) d'un fichier mensuel de bougies 1 min officielles."""
+    return request.param, pd.read_parquet(request.param)
 
 
 @pytest.fixture(scope="module", params=params_for("futures_funding"))
@@ -202,9 +205,8 @@ def funding(request):
     return request.param, pd.read_parquet(request.param)
 
 
-# =========================================================================== klines 1s : structure
+# =========================================================================== bougies 1 s : structure
 
-@pytest.mark.klines
 @pytest.mark.structure
 class TestKlinesStructure:
     """Le fichier a-t-il la forme attendue ? Prérequis de tous les autres tests."""
@@ -216,56 +218,59 @@ class TestKlinesStructure:
         Pourquoi : un fichier vide est le symptôme typique d'un téléchargement interrompu
         ou d'un fichier ZIP mal lu. Comme download_binance.py ne re-télécharge pas un mois
         déjà présent sur disque, un fichier vide resterait vide pour toujours sans ce test.
+        Un fichier ABSENT n'est pas vu ici : c'est le rôle du contrat de couverture.
         """
         path, df = klines
-        assert len(df) > 0, f"{path.name} est vide : supprime-le et relance download_binance.py"
+        assert len(df) > 0, f"{path.name} est vide : relance download_binance.py --force pour ce mois"
 
     def test_columns(self, klines):
         """
-        Les colonnes sont exactement celles attendues, dans le bon ordre.
+        Les colonnes du fichier stocké sont exactement celles attendues, dans le bon ordre.
 
-        Pourquoi : Binance nomme les colonnes par position, pas par nom (les CSV spot n'ont
-        pas d'en-tête). Si Binance ajoutait ou retirait une colonne, toutes les suivantes
-        seraient décalées : le volume deviendrait le prix de clôture, etc. Le code
-        continuerait de tourner et le modèle apprendrait n'importe quoi.
+        Portée : c'est le schéma de SORTIE du parser qui est vérifié. Les CSV spot de Binance
+        n'ont pas d'en-tête et sont lus par position : un décalage des colonnes source
+        passerait ce test, mais serait attrapé par les contrôles de valeurs (OHLC, VWAP,
+        volume acheteur) et, pour le perpétuel, par la comparaison aux bougies officielles.
         """
         _, df = klines
         assert list(df.columns) == EXPECTED_KLINE_COLS
 
     def test_dtypes(self, klines):
         """
-        Les dates sont des datetimes UTC et toutes les autres colonnes sont numériques.
+        Dates en datetime UTC, colonnes numériques, n_trades entier.
 
-        Pourquoi : une colonne de prix lue comme texte ne plante pas toujours (pandas sait
-        concaténer des chaînes), mais elle casse silencieusement les calculs. Quant au
-        fuseau horaire, mélanger UTC et heure de Paris décale les données d'une ou deux
-        heures, ce qui suffit à introduire du « futur » dans les features (fuite de données).
+        Pourquoi : une colonne de prix lue comme texte casse silencieusement les calculs.
+        Mélanger UTC et heure de Paris décale les données d'une ou deux heures, assez pour
+        introduire du « futur » dans les features (fuite de données). Un compteur de trades
+        non entier signalerait une erreur de parsing.
         """
         _, df = klines
         for col in ("open_time", "close_time"):
             assert pd.api.types.is_datetime64_any_dtype(df[col]), f"{col} n'est pas un datetime"
             assert str(df[col].dt.tz) == "UTC", f"{col} n'est pas en UTC"
-        for col in EXPECTED_KLINE_COLS:
-            if col not in ("open_time", "close_time"):
-                assert pd.api.types.is_numeric_dtype(df[col]), f"{col} n'est pas numérique"
+        for col in NUMERIC_KLINE_COLS:
+            assert pd.api.types.is_numeric_dtype(df[col]), f"{col} n'est pas numérique"
+        assert_no_errors("types", qc.integer_errors(df, "n_trades"))
 
-    def test_no_nan(self, klines):
+    def test_finite_values(self, klines):
         """
-        Aucune valeur manquante (NaN).
+        Aucune valeur manquante (NaN / NaT) ni infinie.
 
-        Pourquoi : download_binance.py convertit les colonnes avec errors="coerce", donc
-        une valeur illisible devient NaN au lieu de provoquer une erreur. Beaucoup de
-        modèles refusent les NaN, et ceux qui les acceptent (LightGBM, XGBoost) leur
-        donnent un sens particulier qui fausserait l'apprentissage.
+        Pourquoi : « numérique et non NaN » ne veut pas dire « fini » : +inf passe les
+        contrôles de signe et de type. download_binance.py convertit avec errors="coerce",
+        donc une valeur illisible devient NaN sans erreur. Beaucoup de modèles refusent NaN
+        et inf, et ceux qui les acceptent leur donnent un sens particulier.
         """
-        _, df = klines
-        nan = df.isna().sum()
-        assert nan.sum() == 0, f"valeurs manquantes :\n{nan[nan > 0]}"
+        path, df = klines
+        errors = qc.finite_errors(df, NUMERIC_KLINE_COLS)
+        nat = df[["open_time", "close_time"]].isna().sum()
+        if nat.sum():
+            errors.append(f"dates manquantes : {nat[nat > 0].to_dict()}")
+        assert_no_errors(path.name, errors)
 
 
-# =========================================================================== klines 1s : temps
+# =========================================================================== bougies 1 s : temps
 
-@pytest.mark.klines
 @pytest.mark.chronologie
 class TestKlinesTime:
     """L'axe du temps est-il propre ? C'est l'épine dorsale de toute série temporelle."""
@@ -274,10 +279,10 @@ class TestKlinesTime:
         """
         Chaque seconde n'apparaît qu'une seule fois.
 
-        Pourquoi : un doublon crée un rendement nul entre deux lignes identiques, et
-        fait compter deux fois le volume de cette seconde. Surtout, il décale d'une ligne
-        tous les calculs du type « prix dans 60 lignes », qui ne correspondent alors plus
-        à « prix dans 60 secondes ». Les variables cibles seraient fausses.
+        Pourquoi : un doublon décale d'une ligne tous les calculs du type « prix dans 60
+        lignes », qui ne correspondent plus à « prix dans 60 secondes ». Portée : ce test
+        voit les bougies en double, pas des trades en double déjà agrégés dans une même
+        bougie (ceux-là sont traités à la reconstruction et détectés par `verification`).
         """
         _, df = klines
         dup = df["open_time"].duplicated()
@@ -287,10 +292,8 @@ class TestKlinesTime:
         """
         Les lignes sont triées par ordre chronologique.
 
-        Pourquoi : les features (moyennes mobiles, rendements) et les cibles (« le prix
-        va-t-il monter ? ») sont calculées avec des décalages de lignes. Sur des données
-        mal triées, « la ligne suivante » n'est plus « la seconde suivante », et le modèle
-        peut voir le futur sans que rien ne le signale.
+        Pourquoi : les features et les cibles sont calculées avec des décalages de lignes.
+        Sur des données mal triées, le modèle peut voir le futur sans que rien ne le signale.
         """
         _, df = klines
         assert df["open_time"].is_monotonic_increasing
@@ -299,155 +302,124 @@ class TestKlinesTime:
         """
         Toutes les bougies appartiennent au mois indiqué par le nom du fichier.
 
-        Pourquoi : tu découperas probablement les données en train / validation / test
-        par période (ex. 2020-2023 pour entraîner, 2024 pour tester). Une bougie de
-        janvier rangée dans le fichier de février brouillerait cette frontière. C'est
-        aussi un bon détecteur d'erreur d'unité de timestamp (ms au lieu de µs), qui
-        enverrait les dates en 1970 ou en l'an 50 000.
+        Pourquoi : le découpage train / test se fera par période. C'est aussi un bon
+        détecteur d'erreur d'unité de timestamp (ms au lieu de µs). Portée : ce test ne
+        prouve pas que TOUT le mois est présent (rôle des tests de trous).
         """
         path, df = klines
-        start = utc(month_of(path))
-        end = utc(next_month(month_of(path)))
+        start, end = month_range(path)
         out = df[(df["open_time"] < start) | (df["open_time"] >= end)]
         assert out.empty, f"{len(out)} lignes hors du mois {start:%Y-%m}, ex. {out['open_time'].head(3).tolist()}"
 
     def test_aligned_on_second(self, klines):
         """
-        Chaque bougie commence pile sur une seconde (pas de millisecondes résiduelles).
+        Chaque bougie commence pile sur une seconde.
 
         Pourquoi : la grille temporelle doit être régulière pour que « une ligne = une
-        seconde » soit vrai après le remplissage des trous. Un open_time à 12:00:00.500
-        ne correspondrait à aucune case de la grille et serait perdu ou dupliqué.
+        seconde » soit vrai après le remplissage des trous courts.
         """
         _, df = klines
         misaligned = df["open_time"] != df["open_time"].dt.floor("s")
         assert not misaligned.any(), f"{misaligned.sum()} open_time non alignés sur la seconde"
 
-    def test_close_time_consistent(self, klines):
+    def test_durations(self, klines):
         """
-        Chaque bougie dure une seconde : close_time = open_time + 999 ms.
+        Chaque bougie dure une seconde : open_time <= close_time < open_time + 1 s.
 
-        Pourquoi : la durée d'une bougie conditionne la comparabilité de son volume et de
-        son amplitude (high - low) avec celles des autres. Une bougie de 3 secondes aurait
-        un volume anormalement grand et fausserait les features de volume et de volatilité.
+        Fin normale : open_time + 999 ms, ou + 999,999 ms pour les timestamps en
+        microsecondes du spot depuis 2025.
 
-        Exception légitime, la bougie tronquée par un arrêt du marché : quand Binance
-        interrompt le trading (maintenance, panne) au milieu d'une seconde, la dernière
-        bougie est fermée à l'instant de l'arrêt et dure moins de 999 ms (parfois 0 ms).
-        Ses données sont réelles. On l'accepte si et seulement si elle est suivie d'un
-        trou, c'est-à-dire si la seconde suivante est absente des données. Le trou peut
-        être long (maintenance) ou court (interruption de quelques secondes).
+        Exception, la bougie TRONQUÉE par un arrêt du marché : quand Binance interrompt le
+        trading au milieu d'une seconde, la dernière bougie est fermée à l'instant de
+        l'arrêt (parfois 0 ms). Elle est acceptée si et seulement si la seconde suivante
+        est absente, y compris quand cette seconde appartiendrait au fichier du mois
+        suivant. Une durée NÉGATIVE n'est jamais acceptée.
 
-        Ces bougies tronquées marquent une fin de série : lors de la construction des
-        features, aucune fenêtre ne doit traverser le trou qui les suit.
-
-        Le test échoue pour toute autre anomalie :
-        - bougie de plus d'une seconde : agrégation incorrecte ;
-        - bougie tronquée suivie d'une bougie normale : aucun arrêt ne l'explique, c'est
-          une donnée suspecte.
+        Pourquoi : une bougie de 3 secondes aurait un volume anormalement grand et
+        fausserait les features de volume et de volatilité.
         """
         path, df = klines
-        delta = df["close_time"] - df["open_time"]
-        too_long = delta >= pd.Timedelta(seconds=1)
-        truncated = delta < pd.Timedelta(milliseconds=999)
-
-        present = pd.DatetimeIndex(df["open_time"])
-        next_missing = ~(df["open_time"] + pd.Timedelta(seconds=1)).isin(present)
-        unexplained = truncated & ~next_missing
-
-        def show(mask):
-            return df.loc[mask, ["open_time", "close_time"]].head(5).to_string(index=False)
-
-        errors = []
-        if too_long.any():
-            errors.append(f"{too_long.sum()} bougie(s) de plus d'une seconde :\n{show(too_long)}")
-        if unexplained.any():
-            errors.append(f"{unexplained.sum()} bougie(s) tronquée(s) sans arrêt du marché "
-                          f"juste après :\n{show(unexplained)}")
-        message = f"{path.name}\n" + "\n".join(errors)
-        assert not errors, message
+        files = files_of(dataset_of(path), DATA)
+        i = files.index(path)
+        next_first = None
+        if i + 1 < len(files):
+            next_first = pd.read_parquet(files[i + 1], columns=["open_time"])["open_time"].min()
+        assert_no_errors(path.name, qc.duration_errors(df, next_first))
 
 
-# =========================================================================== klines 1s : trous
+# =========================================================================== bougies 1 s : trous
 
-@pytest.mark.klines
 @pytest.mark.completude
 class TestKlinesGaps:
     """
     Les secondes manquantes sont-elles explicables ?
 
-    Deux natures de trous, voir gaps.py pour le détail :
-    - courts (<= SHORT_GAP_MAX_SECONDS) : secondes sans aucun trade, on les comble ;
-    - longs : exchange fermé (maintenance, panne), on coupe la série à cet endroit.
+    Deux traitements, selon la durée (voir gaps.py) :
+    - courts (<= SHORT_GAP_MAX_SECONDS) : on reportera le dernier prix, volume à 0 ;
+    - longs : on coupera la série à cet endroit.
+    Les trous sont fusionnés aux changements de mois avant d'être classés.
     """
 
     def test_short_gaps_are_rare(self, klines, kline_gaps):
         """
         Les trous courts représentent une faible part du mois (MAX_SHORT_GAP_RATIO).
 
-        Pourquoi : quelques secondes sans trade sont normales. Mais si elles deviennent
-        nombreuses, c'est que le marché était peu liquide ou que le fichier est incomplet.
-        Dans les deux cas, les secondes comblées artificiellement (prix reporté, volume
-        nul) deviennent une part significative des données : le modèle apprendrait surtout
-        du « rien ne se passe » fabriqué par nous.
-
-        Le seuil dépend du marché. Sur le spot, les klines 1 s de Binance sont presque
-        complètes (seuil 0,5 %). Le perpétuel, lui, a beaucoup de secondes réellement sans
-        trade, surtout en 2020 où l'activité était faible. Pour lui, ce test n'est qu'un
-        garde-fou contre un fichier vide aux trois quarts : la vraie vérification de
-        complétude est la comparaison avec les bougies 1 min officielles (`verification`).
+        Pourquoi : si les secondes comblées artificiellement deviennent une part
+        significative des données, le modèle apprend surtout du « rien ne se passe »
+        fabriqué par nous. Le seuil dépend du marché : 0,5 % sur le spot, 60 % sur le
+        perpétuel (qui a réellement beaucoup de secondes sans trade, surtout en 2020 ; sa
+        complétude est vérifiée par `verification`). Ce ratio ne prouve pas la CAUSE des
+        trous.
         """
         path, _ = klines
-        short, _, n_expected = kline_gaps
+        short, _ = kline_gaps
+        start, end = month_range(path)
+        clipped_start = short["start"].where(short["start"] > start, start)
+        clipped_end = short["end"].where(short["end"] < end - qc.ONE_S, end - qc.ONE_S)
+        missing = int(((clipped_end - clipped_start) // qc.ONE_S + 1).clip(lower=0).sum())
+        n_expected = int((end - start) / qc.ONE_S)
         limit = MAX_SHORT_GAP_RATIO[dataset_of(path)]
-        missing = int(short["duration_s"].sum())
         ratio = missing / n_expected
         assert ratio <= limit, (
             f"{path.name} : {missing} s manquantes en trous courts ({ratio:.4%}, max {limit:.4%})\n"
             f"{len(short)} trous courts, les plus longs :\n{describe_gaps(short)}"
         )
 
-    def test_long_gaps_are_known(self, klines, kline_gaps, known_gaps):
+    def test_long_gaps_are_approved(self, klines, kline_gaps, known_gaps):
         """
-        Chaque trou long figure dans le registre data/known_gaps.csv.
+        Chaque trou long est inscrit dans data/known_gaps.csv ET approuvé, avec une raison.
 
-        Pourquoi : un trou long a deux explications possibles, et elles appellent des
-        réactions opposées :
-        - l'exchange était fermé : le trou est réel, on l'accepte et on coupe la série ;
-        - le téléchargement a raté une partie du fichier : il faut re-télécharger.
-        Le registre sert à trancher. Un trou long qui n'y figure pas est une nouveauté à
-        examiner. Une fois vérifié (par exemple en cherchant une annonce de maintenance
-        Binance à cette date), on l'ajoute au registre avec `python gaps.py` et on peut
-        renseigner la colonne `reason`.
-
-        Le registre est ensuite réutilisé pour construire les jeux de données : aucune
-        fenêtre de features ni variable cible ne doit chevaucher un trou long.
+        Pourquoi : un trou long a deux explications possibles qui appellent des réactions
+        opposées : fermeture réelle de l'exchange (on coupe la série) ou téléchargement
+        raté (on re-télécharge). L'inscription automatique par gaps.py n'est qu'une
+        DÉTECTION (statut candidate) : seul un examen humain, tracé par le statut approved
+        et une raison, permet d'accepter le trou. Une journée entière manquante n'est
+        jamais une maintenance.
         """
         path, _ = klines
-        _, long_, _ = kline_gaps
-        known = {(r.start, r.end) for r in known_gaps.itertuples() if r.dataset == dataset_of(path)}
-        unknown = long_[[(r.start, r.end) not in known for r in long_.itertuples()]]
-        assert unknown.empty, (
-            f"{path.name} : {len(unknown)} trou(s) long(s) absent(s) de {known_gaps_path()}\n"
-            f"{describe_gaps(unknown)}\n"
-            "Vérifie qu'il s'agit bien d'une fermeture de Binance, puis lance `python gaps.py`. "
-            "Sinon, supprime le fichier du mois et re-télécharge-le."
+        _, long_ = kline_gaps
+        ok = approved(known_gaps)
+        ok = {(r.start, r.end) for r in ok.itertuples() if r.dataset == dataset_of(path)}
+        pending = long_[[(r.start, r.end) not in ok for r in long_.itertuples()]]
+        assert pending.empty, (
+            f"{path.name} : {len(pending)} trou(s) long(s) non approuvé(s) dans {known_gaps_path()}\n"
+            f"{describe_gaps(pending)}\n"
+            "Lance python gaps.py, examine chaque trou (maintenance annoncée ? téléchargement raté ?), "
+            "puis python approve.py gaps <date> \"<raison>\". Sinon, re-télécharge le mois."
         )
 
 
-# =========================================================================== klines 1s : valeurs
+# =========================================================================== bougies 1 s : prix
 
-@pytest.mark.klines
 @pytest.mark.coherence
 class TestKlinesPrices:
     """Les prix sont-ils économiquement plausibles ?"""
 
     def test_prices_positive(self, klines):
         """
-        Tous les prix sont strictement positifs.
+        Tous les prix sont strictement positifs (et finis, voir test_finite_values).
 
-        Pourquoi : un prix nul ou négatif est impossible sur le spot et casse les calculs
-        de rendements logarithmiques (log(0) = -inf), très utilisés comme features.
+        Pourquoi : un prix nul ou négatif casse les rendements logarithmiques (log(0) = -inf).
         """
         _, df = klines
         prices = df[["open", "high", "low", "close"]]
@@ -457,10 +429,9 @@ class TestKlinesPrices:
         """
         Le plus haut est au-dessus de l'ouverture et de la clôture, le plus bas en dessous.
 
-        Pourquoi : c'est la définition même d'une bougie. Si ce n'est pas vrai, les
-        colonnes ont été mélangées (erreur de parsing) ou la donnée est corrompue. Les
-        features de volatilité (high - low) et les simulations de stop-loss, qui
-        regardent si le prix a touché un niveau pendant la seconde, seraient fausses.
+        Pourquoi : c'est la définition d'une bougie. Portée : une bougie fausse mais
+        cohérente passe ce test ; pour le perpétuel, la comparaison aux bougies officielles
+        complète ce contrôle.
         """
         _, df = klines
         bad_high = df["high"] < df[["open", "close"]].max(axis=1)
@@ -470,45 +441,32 @@ class TestKlinesPrices:
 
     def test_no_absurd_price_jump(self, klines):
         """
-        Pas de variation de prix supérieure à MAX_PRICE_JUMP d'une seconde à l'autre
-        (10 % sur le spot, 15 % sur le perpétuel).
+        Pas de variation SIMPLE du prix de clôture supérieure à MAX_PRICE_JUMP d'une seconde
+        à l'autre, dans un sens comme dans l'autre (±10 % sur le spot, ±15 % sur le
+        perpétuel).
 
-        Pourquoi : même lors des krachs les plus violents, le bitcoin ne perd pas 10 % en
-        une seconde sur Binance spot. Un tel saut indique presque toujours une erreur
-        (prix d'une autre paire, virgule décalée). Un seul point aberrant suffit à fausser
-        la normalisation des features et peut devenir le « trade parfait » que le modèle
-        cherchera ensuite à reproduire. Avec un levier x5, un tel saut en réel signifierait
-        une liquidation : il faut en être certain avant de l'accepter.
-
-        Le perpétuel a un seuil plus large : lors des cascades de liquidations, il connaît
-        de vraies mèches extrêmes. Le 18/04/2021 à 03:35:44, il a pris 12 % en une seconde,
-        et la bougie 1 min officielle de Binance confirme ce plus haut.
-
-        Seules les bougies séparées d'exactement une seconde sont comparées : de part et
-        d'autre d'un trou (maintenance, journée manquante), le prix a pu varier de plus de
-        10 % sans que ce soit une erreur.
+        Pourquoi : un tel saut indique presque toujours une erreur (autre paire, virgule
+        décalée), qui fausserait la normalisation des features. Le perpétuel a un seuil
+        plus large : le 18/04/2021 à 03:35:44, il a pris 12 % en une seconde, et la bougie
+        1 min officielle confirme ce plus haut. Seules les secondes consécutives sont
+        comparées ; ce test porte sur les clôtures, pas sur les mèches intra-seconde.
         """
         path, df = klines
-        limit = MAX_PRICE_JUMP[dataset_of(path)]
-        consecutive = df["open_time"].diff() == pd.Timedelta(seconds=1)
-        ret = np.log(df["close"]).diff().abs()
-        jumps = df.loc[consecutive & (ret > np.log1p(limit)), "open_time"]
-        assert jumps.empty, f"{len(jumps)} sauts de prix > {limit:.0%} en 1 s, ex. {jumps.head(3).tolist()}"
+        assert_no_errors(path.name, qc.price_jump_errors(df, MAX_PRICE_JUMP[dataset_of(path)]))
 
 
+# =========================================================================== bougies 1 s : volumes
 
-@pytest.mark.klines
 @pytest.mark.volumes
 class TestKlinesVolumes:
     """Les volumes sont-ils cohérents entre eux et avec les prix ?"""
 
     def test_volumes(self, klines):
         """
-        Les volumes sont positifs et le volume acheteur ne dépasse pas le volume total.
+        Volumes positifs, et volume acheteur <= volume total.
 
         Pourquoi : le déséquilibre acheteurs / vendeurs (taker_buy_base / volume) est une
-        des features les plus informatives à court terme. Il doit rester entre 0 et 1. Un
-        volume acheteur supérieur au volume total signalerait des colonnes inversées.
+        des features les plus informatives à court terme. Il doit rester entre 0 et 1.
         """
         _, df = klines
         for col in ("volume", "quote_volume", "taker_buy_base", "taker_buy_quote", "n_trades"):
@@ -516,53 +474,151 @@ class TestKlinesVolumes:
         assert (df["taker_buy_base"] <= df["volume"] * (1 + 1e-9)).all(), "taker_buy_base > volume"
         assert (df["taker_buy_quote"] <= df["quote_volume"] * (1 + 1e-9)).all(), "taker_buy_quote > quote_volume"
 
-    def test_trades_imply_volume(self, klines):
+    def test_zero_consistency(self, klines):
         """
-        Une bougie avec des trades a forcément un volume non nul.
+        Les volumes nuls vont ensemble : volume nul <=> quote_volume nul (idem acheteur), et
+        pas de trades sans volume.
 
-        Pourquoi : c'est une cohérence interne simple. Si elle est violée, les colonnes
-        n_trades et volume ne décrivent pas la même chose (décalage de colonnes).
+        Pourquoi : un quote_volume sans volume (ou l'inverse) signale des colonnes décalées.
         """
-        _, df = klines
-        bad = (df["n_trades"] > 0) & (df["volume"] <= 0)
-        assert not bad.any(), f"{bad.sum()} bougies avec des trades mais un volume nul"
+        path, df = klines
+        assert_no_errors(path.name, qc.zero_consistency_errors(df))
 
-    def test_quote_volume_matches_price(self, klines):
+    def test_vwap_in_range(self, klines):
         """
-        Le prix moyen implicite (quote_volume / volume) est compris entre low et high.
+        Les prix moyens implicites restent dans [low, high], à MAX_VWAP_TOL près (0,1 %) :
+        quote_volume / volume pour tous les trades, taker_buy_quote / taker_buy_base pour
+        les trades à l'initiative de l'acheteur.
 
-        Pourquoi : quote_volume est le montant en USDT échangé, volume la quantité de BTC.
-        Leur rapport est donc le prix moyen des trades de la seconde (VWAP), qui ne peut
-        pas sortir de la fourchette [low, high]. C'est un contrôle croisé fort entre les
-        colonnes de prix et de volume : s'il échoue, l'une des deux familles est fausse.
+        Pourquoi : c'est un contrôle croisé fort entre les colonnes de prix et de volume.
+        La marge de 0,1 % est une marge de prudence pour les arrondis des volumes publiés ;
+        elle n'a pas été calibrée sur des cas réels.
         """
-        _, df = klines
-        v = df[df["volume"] > 0]
-        vwap = v["quote_volume"] / v["volume"]
-        bad = (vwap < v["low"] * 0.999) | (vwap > v["high"] * 1.001)
-        assert not bad.any(), f"{bad.sum()} bougies avec un prix moyen hors de [low, high]"
+        path, df = klines
+        assert_no_errors(path.name, qc.vwap_errors(df, MAX_VWAP_TOL))
 
-# =========================================================================== couverture globale
 
-class TestCoverage:
-    """L'ensemble des fichiers forme-t-il un historique continu et à jour ?"""
+# =========================================================================== référence 1 min officielle
 
-    @pytest.mark.parametrize("dataset", list(DATASETS))
-    @pytest.mark.completude
-    @pytest.mark.klines
-    @pytest.mark.funding
-    def test_no_missing_month(self, dataset):
+class TestReference1m:
+    """
+    Les bougies 1 min officielles servent d'ORACLE pour vérifier le perpétuel : elles
+    reçoivent donc leurs propres contrôles de structure, de temps et de valeurs.
+    """
+
+    @pytest.mark.structure
+    def test_structure(self, reference_1m):
+        """Fichier non vide, colonnes attendues, dates UTC, valeurs finies, n_trades entier."""
+        path, df = reference_1m
+        assert len(df) > 0, f"{path.name} est vide"
+        assert list(df.columns) == EXPECTED_KLINE_COLS
+        errors = qc.finite_errors(df, NUMERIC_KLINE_COLS) + qc.integer_errors(df, "n_trades")
+        for col in ("open_time", "close_time"):
+            if str(df[col].dt.tz) != "UTC":
+                errors.append(f"{col} n'est pas en UTC")
+        assert_no_errors(path.name, errors)
+
+    @pytest.mark.chronologie
+    def test_time_axis(self, reference_1m):
+        """Pas de doublon, trié, dans le mois du fichier, aligné sur la minute, durée d'une minute."""
+        path, df = reference_1m
+        start, end = month_range(path)
+        errors = []
+        if df["open_time"].duplicated().any():
+            errors.append(f"{df['open_time'].duplicated().sum()} minutes en double")
+        if not df["open_time"].is_monotonic_increasing:
+            errors.append("minutes non triées")
+        outside = (df["open_time"] < start) | (df["open_time"] >= end)
+        if outside.any():
+            errors.append(f"{outside.sum()} minutes hors du mois")
+        if (df["open_time"] != df["open_time"].dt.floor("min")).any():
+            errors.append("open_time non alignés sur la minute")
+        delta = df["close_time"] - df["open_time"]
+        bad = (delta < pd.Timedelta(seconds=59)) | (delta >= qc.ONE_MIN)
+        if bad.any():
+            errors.append(f"{bad.sum()} bougies dont la durée n'est pas d'une minute")
+        assert_no_errors(path.name, errors)
+
+    @pytest.mark.coherence
+    def test_values(self, reference_1m):
+        """Prix positifs, OHLC cohérents, volumes positifs, acheteur <= total, nuls cohérents."""
+        path, df = reference_1m
+        errors = []
+        if not (df[["open", "high", "low", "close"]] > 0).all().all():
+            errors.append("prix nuls ou négatifs")
+        if (df["high"] < df[["open", "close"]].max(axis=1)).any() or (df["low"] > df[["open", "close"]].min(axis=1)).any():
+            errors.append("OHLC incohérents")
+        if (df[["volume", "quote_volume", "taker_buy_base", "taker_buy_quote"]] < 0).any().any():
+            errors.append("volumes négatifs")
+        if (df["taker_buy_base"] > df["volume"] * (1 + 1e-9)).any():
+            errors.append("taker_buy_base > volume")
+        errors += [e for e in qc.zero_consistency_errors(df) if "trades mais" not in e]
+        assert_no_errors(path.name, errors)
+
+
+# =========================================================================== contrat de couverture
+
+@pytest.mark.completude
+class TestCoverageContract:
+    """
+    Les données présentes sont-elles celles attendues (data_contract.py) ?
+
+    Pourquoi : les autres tests ne voient que les fichiers présents. Sans ce contrat, un
+    téléchargement partiel ou un mauvais dossier de données réduit silencieusement ce qui
+    est contrôlé, et pytest peut rester vert avec des dizaines de tests ignorés. En mode
+    VALIDATION_MODE=partial, ces tests sont ignorés avec un avertissement : un résultat
+    partiel ne vaut pas validation.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _mode(self):
+        if contract.validation_mode() == "partial":
+            warnings.warn("VALIDATION_MODE=partial : contrat de couverture NON vérifié", stacklevel=1)
+            pytest.skip("mode partial : contrat de couverture non vérifié")
+
+    @pytest.mark.parametrize("dataset", dataset_params(*contract.REQUIRED_DATASETS))
+    def test_dataset_present_from_expected_start(self, dataset):
+        """Le dataset existe et commence au premier mois attendu (janvier 2020)."""
+        files = files_of(dataset, DATA)
+        assert files, f"{dataset} : aucun fichier dans {DATA / dataset}"
+        first = f"{month_of(files[0]):%Y-%m}"
+        assert first == contract.REQUIRED_DATASETS[dataset], (
+            f"{dataset} : premier mois {first}, attendu {contract.REQUIRED_DATASETS[dataset]}")
+
+    @pytest.mark.parametrize("dataset", dataset_params(*contract.REQUIRED_DATASETS))
+    def test_up_to_expected_last_month(self, dataset):
         """
-        Aucun mois manquant entre le premier et le dernier fichier téléchargé.
-
-        Pourquoi : download_binance.py ignore silencieusement un mois indisponible (erreur
-        404). Un mois manquant au milieu de l'historique passerait inaperçu, mais créerait
-        un trou d'un mois que les tests par fichier ne peuvent pas voir, puisqu'il n'y a
-        pas de fichier à tester.
+        Le dernier mois présent est au moins le dernier mois attendu (fraîcheur) : le mois
+        en cours pour les datasets journaliers, le mois précédent pour le funding (publié
+        mensuellement).
         """
         files = files_of(dataset, DATA)
-        if not files:
-            pytest.skip(f"aucun fichier pour {dataset}")
+        assert files, f"{dataset} : aucun fichier"
+        last, expected = month_of(files[-1]), contract.expected_last_month(dataset)
+        assert last >= expected, f"{dataset} : dernier mois {last:%Y-%m}, attendu au moins {expected:%Y-%m}"
+
+    @pytest.mark.parametrize("dataset", dataset_params(*sorted(contract.DAILY_DATASETS)))
+    def test_recent_days_complete(self, dataset):
+        """
+        Pour les datasets journaliers, la journée d'avant-hier est présente jusqu'à sa
+        dernière minute (Binance publie les fichiers journaliers avec un jour de décalage).
+        """
+        files = files_of(dataset, DATA)
+        assert files, f"{dataset} : aucun fichier"
+        last = pd.read_parquet(files[-1], columns=["open_time"])["open_time"].max()
+        limit = utc(date.today() - timedelta(days=1)) - pd.Timedelta(minutes=2)
+        assert last >= limit, f"{dataset} : dernière donnée au {last}, attendue après {limit}. Relance download_binance.py"
+
+    @pytest.mark.parametrize("dataset", dataset_params(*contract.REQUIRED_DATASETS))
+    def test_no_missing_month(self, dataset):
+        """
+        Aucun mois manquant entre le premier et le dernier fichier.
+
+        Pourquoi : download_binance.py ignore un mois indisponible (404). Un mois manquant
+        au milieu de l'historique n'a pas de fichier à tester.
+        """
+        files = files_of(dataset, DATA)
+        assert files, f"{dataset} : aucun fichier"
         present = {month_of(p) for p in files}
         m, last = min(present), max(present)
         missing = []
@@ -572,68 +628,66 @@ class TestCoverage:
             m = next_month(m)
         assert not missing, f"{dataset} : mois manquants {missing}"
 
-    @pytest.mark.parametrize("dataset", SECOND_DATASETS)
-    @pytest.mark.completude
-    @pytest.mark.klines
-    def test_klines_up_to_date(self, dataset):
-        """
-        Les données 1s vont au moins jusqu'à avant-hier.
+    @pytest.mark.perp
+    @pytest.mark.verification
+    def test_reference_for_every_perp_month(self):
+        """Chaque mois du perpétuel 1 s a sa référence 1 min officielle (sinon il n'est pas vérifié)."""
+        perp = {month_of(p) for p in files_of("futures_klines_1s", DATA)}
+        ref = {month_of(p) for p in files_of("futures_klines_1m", DATA)}
+        missing = sorted(perp - ref)
+        assert perp, "aucun fichier futures_klines_1s"
+        assert not missing, f"mois du perpétuel sans référence 1 min : {[f'{m:%Y-%m}' for m in missing]}"
 
-        Pourquoi : Binance publie les fichiers journaliers avec un jour de décalage. Au-delà,
-        c'est que le téléchargement n'a pas été relancé. Entraîner ou évaluer sur des
-        données périmées fait passer à côté du régime de marché actuel, qui est celui
-        dans lequel le bot tradera.
-        """
-        files = files_of(dataset, DATA)
-        if not files:
-            pytest.skip(f"aucun fichier pour {dataset}")
-        last = pd.read_parquet(files[-1], columns=["open_time"])["open_time"].max()
-        limit = utc(date.today() - timedelta(days=2))
-        assert last >= limit, f"{dataset} : dernière donnée au {last}, relance download_binance.py"
 
-    @pytest.mark.structure
-    @pytest.mark.klines
-    @pytest.mark.funding
-    def test_no_leftover_tmp_files(self):
-        """
-        Aucun fichier .tmp ne traîne dans le dossier de données.
+@pytest.mark.structure
+def test_no_leftover_tmp_files():
+    """
+    Aucun fichier .tmp ne traîne dans le dossier de données.
 
-        Pourquoi : download_binance.py écrit d'abord dans un .tmp puis le renomme, pour
-        qu'une interruption ne laisse jamais un Parquet à moitié écrit. Un .tmp restant
-        signifie donc qu'une écriture a été interrompue : le mois correspondant est
-        peut-être incomplet et doit être re-téléchargé.
-        """
-        tmp = list(DATA.rglob("*.tmp"))
-        assert not tmp, f"fichiers temporaires restants : {tmp}"
+    Pourquoi : download_binance.py écrit d'abord dans un .tmp puis le renomme. Un .tmp
+    restant signifie qu'une écriture a été interrompue.
+    """
+    tmp = list(DATA.rglob("*.tmp"))
+    assert not tmp, f"fichiers temporaires restants : {tmp}"
 
+
+# =========================================================================== registres
 
 @pytest.mark.registre
-@pytest.mark.completude
-class TestKnownGapsRegistry:
-    """Le registre des trous longs est-il lui-même cohérent ?"""
+class TestGapRegistry:
+    """Le registre des trous longs est-il bien formé, examiné et à jour ?"""
 
-    def test_registry_well_formed(self, known_gaps):
+    def test_well_formed(self, known_gaps):
         """
-        Chaque entrée du registre a une fin après son début et une durée cohérente.
+        Datasets connus, bornes alignées sur la seconde, fin après début, durée cohérente,
+        statut valide, raison obligatoire pour une entrée approuvée.
 
-        Pourquoi : le registre est édité à la main (colonne reason) et sera utilisé pour
-        couper les séries lors de la construction des datasets. Une ligne corrompue
-        ferait couper au mauvais endroit, ou pas du tout.
+        Pourquoi : le registre est édité à la main et servira à couper les séries lors de
+        la construction des features. Une ligne corrompue ferait couper au mauvais endroit.
         """
         if known_gaps.empty:
             pytest.skip("registre vide ou absent, lance `python gaps.py`")
-        assert (known_gaps["end"] >= known_gaps["start"]).all(), "trou avec end < start"
-        computed = ((known_gaps["end"] - known_gaps["start"]) // pd.Timedelta(seconds=1) + 1).astype("int64")
-        assert (computed == known_gaps["duration_s"]).all(), "duration_s incohérent avec start / end"
+        g = known_gaps
+        errors = []
+        if not g["dataset"].isin(SECOND_DATASETS).all():
+            errors.append(f"dataset inconnu : {sorted(set(g['dataset']) - set(SECOND_DATASETS))}")
+        if ((g["start"] != g["start"].dt.floor("s")) | (g["end"] != g["end"].dt.floor("s"))).any():
+            errors.append("bornes non alignées sur la seconde")
+        if (g["end"] < g["start"]).any():
+            errors.append("trou avec end < start")
+        computed = ((g["end"] - g["start"]) // qc.ONE_S + 1).astype("int64")
+        if (computed != g["duration_s"]).any():
+            errors.append("duration_s incohérent avec start / end")
+        if not g["status"].isin(STATUSES).all():
+            errors.append(f"statut invalide : {sorted(set(g['status']) - set(STATUSES))}")
+        if ((g["status"] == "approved") & (g["reason"].str.strip() == "")).any():
+            errors.append("entrée approuvée sans raison")
+        if g.duplicated(["dataset", "start", "end"]).any():
+            errors.append("entrées en double")
+        assert_no_errors(str(known_gaps_path()), errors)
 
-    def test_registry_no_overlap(self, known_gaps):
-        """
-        Les trous du registre ne se chevauchent pas.
-
-        Pourquoi : deux trous qui se chevauchent sont le signe d'une édition manuelle
-        erronée ou d'un registre construit avec deux seuils différents. Cela fausserait
-        le décompte des heures de fermeture et le découpage des séries.
-        """
+    def test_no_overlap(self, known_gaps):
+        """Les trous du registre ne se chevauchent pas (même dataset)."""
         if known_gaps.empty:
             pytest.skip("registre vide ou absent, lance `python gaps.py`")
         for dataset, g in known_gaps.groupby("dataset"):
@@ -641,206 +695,196 @@ class TestKnownGapsRegistry:
             overlap = g["start"].iloc[1:].values <= g["end"].iloc[:-1].values
             assert not overlap.any(), f"{dataset} : {overlap.sum()} trous qui se chevauchent"
 
+    def test_no_stale_entry(self, known_gaps):
+        """
+        Chaque entrée du registre correspond encore à un trou long détecté.
+
+        Pourquoi : après une réparation, un trou disparaît ; son exception devient
+        obsolète et pourrait masquer un futur problème au même endroit.
+        """
+        if known_gaps.empty:
+            pytest.skip("registre vide ou absent")
+        detected = detected_long_gaps()
+        keys = set(zip(detected["dataset"], detected["start"], detected["end"]))
+        stale = known_gaps[[(r.dataset, r.start, r.end) not in keys for r in known_gaps.itertuples()]]
+        assert stale.empty, f"{len(stale)} entrée(s) obsolète(s) :\n{stale.head(10).to_string(index=False)}\nRelance python gaps.py."
+
+
+@pytest.mark.registre
+@pytest.mark.perp
+class TestMismatchRegistry:
+    """Le registre des minutes irréparables du perpétuel est-il bien formé ?"""
+
+    def test_well_formed(self, known_mismatches):
+        """
+        Types de minute connus, minutes alignées, pas de doublon ni de minute inscrite sous
+        deux types, statut valide, raison obligatoire pour une entrée approuvée.
+        """
+        if known_mismatches.empty:
+            pytest.skip("registre vide ou absent")
+        assert_no_errors(str(known_mismatches_path()), qc.registry_errors(known_mismatches))
+
 
 # =========================================================================== vérification croisée
 
-@pytest.fixture(scope="module", params=months_in_both("futures_klines_1s", "futures_klines_1m"))
-def perp_1s_vs_1m(request):
+def perp_month_params():
+    params = []
+    ref = {month_of(p): p for p in files_of("futures_klines_1m", DATA)}
+    for p in files_of("futures_klines_1s", DATA):
+        m = month_of(p)
+        marks = [pytest.mark.skip(reason="référence 1 min absente (voir le contrat de couverture)")] if m not in ref else []
+        params.append(pytest.param((p, ref.get(m)), id=f"{m:%Y-%m}", marks=marks))
+    return params or [pytest.param(None, marks=pytest.mark.skip(reason="aucun fichier futures_klines_1s"))]
+
+
+@pytest.fixture(scope="module", params=perp_month_params())
+def perp_pair(request):
     """
-    Pour un mois donné : les bougies 1 s reconstruites agrégées en 1 min, et les bougies
-    1 min officielles de Binance (limitées aux minutes où il y a eu des trades).
+    Pour un mois : nos bougies 1 s agrégées en 1 min, et les bougies 1 min officielles
+    (minutes avec trades), après application des exceptions APPROUVÉES du registre.
     """
     path_1s, path_1m = request.param
-    s = pd.read_parquet(path_1s)
-    ours = s.groupby(s["open_time"].dt.floor("min")).agg(
-        open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"),
-        volume=("volume", "sum"), quote_volume=("quote_volume", "sum"),
-        n_trades=("n_trades", "sum"), taker_buy_base=("taker_buy_base", "sum"),
-    )
-    official = pd.read_parquet(path_1m)
-    official = official[official["volume"] > 0].set_index("open_time")[ours.columns]
-
-    # minutes déclarées irréparables : retirées de la comparaison des deux côtés
-    known = load_known_mismatches()
-    invalid = known.loc[known["side"] == "zone_invalide", "minute"]
-    official = official[~official.index.isin(known.loc[known["side"] == "absente_chez_nous", "minute"])]
-    ours = ours[~ours.index.isin(known.loc[known["side"] == "absente_chez_binance", "minute"])]
-    # zones jugées non fiables (incident chez Binance) : exclues des deux côtés
-    official = official[~official.index.isin(invalid)]
-    ours = ours[~ours.index.isin(invalid)]
-    return path_1s.name, ours, official
-
-
-def comparable(ours: pd.DataFrame, official: pd.DataFrame) -> pd.DataFrame:
-    """
-    Nos minutes, sans celles absentes des bougies officielles.
-
-    Quand le fichier officiel 1 min est lui-même incomplet, il n'y a rien à quoi comparer
-    ces minutes : les garder ferait échouer les tests de prix et de dérive à cause d'un
-    trou chez Binance, pas chez nous. Elles sont signalées par test_no_missing_minutes.
-    """
-    return ours[ours.index.isin(official.index)]
+    start, end = month_range(path_1s)
+    ours_full = qc.to_minutes(pd.read_parquet(path_1s))
+    official_full = qc.official_minutes(pd.read_parquet(path_1m))
+    ours, official, reg_errors, stats = qc.apply_registry(ours_full, official_full, load_known_mismatches(), start, end)
+    return {"name": path_1s.name, "ours": ours, "official": official, "ours_full": ours_full,
+            "registry_errors": reg_errors, "stats": stats}
 
 
 @pytest.mark.perp
 @pytest.mark.verification
 class TestPerpetualVsOfficial1m:
     """
-    Les bougies 1 s du perpétuel, que nous reconstruisons nous-mêmes à partir des
-    aggTrades, sont-elles justes ?
+    Les bougies 1 s du perpétuel, reconstruites à partir des aggTrades, concordent-elles
+    avec les bougies 1 min officielles de Binance ?
 
-    Binance ne publie pas de bougies 1 s pour les futures, mais publie des bougies 1 min,
-    calculées de son côté. En agrégeant nos bougies 1 s par minute, on les compare à ces
-    bougies officielles. C'est un contrôle par une source indépendante : contrairement aux
-    autres tests, qui vérifient la cohérence interne, il détecte aussi une erreur plausible
-    mais fausse (trade oublié, mauvais sens acheteur / vendeur, décalage d'horodatage).
+    C'est un contrôle par un pipeline de calcul indépendant, mais du MÊME fournisseur :
+    des lacunes communes aux deux produits ne seraient pas vues. Même une concordance
+    parfaite à la minute ne prouverait pas l'exactitude seconde par seconde ; la logique
+    de reconstruction elle-même est vérifiée par les tests unitaires.
 
-    Pourquoi la concordance minute par minute n'est pas parfaite : certains trades situés
-    à quelques millisecondes d'un changement de minute sont rangés dans la minute voisine
-    chez Binance. Sur juin 2023, 76 % des minutes en excès sont compensées exactement par la
-    minute d'à côté, et le volume du mois est identique. L'horodatage des aggTrades diffère
-    donc très légèrement de celui des bougies officielles. Pour un modèle à la seconde, un
-    décalage de quelques millisecondes est sans conséquence.
-
-    Les tests vérifient donc ce qui doit rester vrai malgré ces déplacements :
-    - aucune minute officielle ne manque chez nous ;
-    - nos prix extrêmes restent dans ceux des minutes officielles voisines ;
-    - le volume cumulé ne dérive jamais durablement (un trade déplacé est compensé à la
-      minute suivante, un trade perdu ou en double crée une dérive qui persiste) ;
-    - le volume total du mois concorde.
-
-    Le nombre de trades (n_trades) n'est pas comparé : nous le calculons à partir des plages
-    d'identifiants des aggTrades, qui incluent des identifiants qui ne sont pas des trades de
-    marché. C'est une approximation par excès, à ne pas utiliser comme une valeur exacte.
+    Écarts attendus et leur traitement :
+    - des trades proches d'un changement de minute sont parfois rangés dans la minute
+      voisine chez Binance (76 % des minutes en excès compensées exactement par la voisine
+      en juin 2023, volume du mois identique). Selon la documentation de Binance, les
+      aggTrades regroupent les trades de même prix et même côté sur 100 ms et excluent
+      ceux du fonds d'assurance et de l'ADL : cela rend plausible une différence de
+      granularité et de périmètre, sans prouver le mécanisme de chaque écart. L'effet d'un
+      tel déplacement sur des features à la seconde n'est PAS démontré négligeable ;
+    - n_trades n'est pas comparé : notre valeur, calculée à partir des plages
+      d'identifiants, dépasse l'officielle même quand les volumes concordent. C'est une
+      approximation, à ne pas utiliser comme un nombre exact.
     """
 
-    def test_no_missing_minutes(self, perp_1s_vs_1m):
+    def test_registry_up_to_date(self, perp_pair):
         """
-        Toute minute avec des trades chez Binance existe aussi dans nos données.
-
-        Pourquoi : une minute absente chez nous signifie que des trades ont été perdus. Des
-        blocs de 1 440 minutes (journées entières) indiquent un fichier mensuel incomplet
-        chez Binance : download_binance.py les répare avec les fichiers journaliers.
-
-        Les minutes présentes chez nous mais absentes des bougies officielles sont
-        seulement signalées par un avertissement : c'est alors le fichier officiel 1 min
-        qui est incomplet, pas nos données. Elles sont exclues des autres comparaisons.
-        Dans les deux cas, download_binance.py tente de réparer la journée concernée.
-
-        Si le fichier journalier de Binance est lui aussi incomplet, la minute est
-        irréparable. Après vérification, `python diagnose_perp.py --register` l'enregistre
-        dans data/known_minute_mismatches.csv, et elle est alors exclue de toutes les
-        comparaisons (même principe que known_gaps.csv pour les trous longs).
+        Les exceptions du mois sont toutes examinées (pas de candidate) et aucune n'est
+        obsolète (une minute déclarée absente est désormais présente).
         """
-        name, ours, official = perp_1s_vs_1m
-        missing = official.index.difference(ours.index)
-        extra = ours.index.difference(official.index)
-        if not extra.empty:
-            warnings.warn(f"{name} : {len(extra)} minute(s) absente(s) des bougies 1 min officielles, "
-                          f"ex. {list(extra[:3])}", stacklevel=1)
-        days = pd.Series(missing.floor("D")).value_counts().sort_index()
-        full_days = [f"{d:%Y-%m-%d}" for d, n in days.items() if n >= 1440]
-        assert missing.empty, (
-            f"{name} : {len(missing)} minute(s) absente(s) de nos données, ex. {list(missing[:3])}\n"
-            f"journées entières manquantes : {full_days or 'aucune'}\n"
-            "Relance download_binance.py (réparation des jours manquants), puis python gaps.py. "
-            f"Si elles persistent, vérifie-les puis enregistre-les dans {known_mismatches_path()} "
-            "avec `python diagnose_perp.py --register`."
-        )
+        assert_no_errors(perp_pair["name"], perp_pair["registry_errors"])
 
-    def test_prices_within_neighbours(self, perp_1s_vs_1m):
+    def test_comparison_coverage(self, perp_pair):
         """
-        Notre plus haut et notre plus bas restent dans ceux des minutes officielles voisines.
+        Assez de minutes sont réellement comparées : au moins MIN_COMPARED_SHARE (99 %) des
+        minutes officielles, et le registre n'exclut pas plus de MAX_EXCLUDED_VOLUME_SHARE
+        (0,5 %) du volume officiel du mois.
 
-        Pourquoi : un trade peut être rangé dans la minute d'à côté, mais son prix, lui,
-        existe forcément chez Binance. Notre high d'une minute ne peut donc pas dépasser le
-        plus haut officiel de cette minute et de ses deux voisines, et de même pour le low.
-        Un dépassement signalerait un prix inventé : mauvaise colonne, erreur de parsing,
-        trade d'une autre paire. C'est ce qui protège les simulations de stop-loss du
-        backtest, qui se déclenchent sur les extrêmes.
-
-        Tolérance MAX_PRICE_EXCESS (0,05 %) : de rares trades isolés dépassent de quelques
-        dollars l'extrême officiel (par exemple 82 047,8 contre 82 032,3 le 10/03/2025, soit
-        0,02 %). Une erreur de parsing ou de colonne produirait des écarts bien plus grands.
+        Pourquoi : chaque exclusion réduit ce qui est vérifié. Sans cette borne, un
+        registre trop généreux pourrait vider la vérification de son sens.
         """
-        name, ours, official = perp_1s_vs_1m
-        ours = comparable(ours, official)
-        # les minutes qui bordent un trou enregistré des bougies officielles n'ont pas de
-        # voisine de référence complète : un trade rangé dans la minute absente ne peut pas
-        # être vérifié, on ne les compare donc pas
-        known = load_known_mismatches()
-        holes = pd.DatetimeIndex(known.loc[known["side"] == "absente_chez_binance", "minute"])
-        one = pd.Timedelta(minutes=1)
-        ours = ours[~ours.index.isin(holes.union(holes - one).union(holes + one))]
-        grid = official.reindex(ours.index.union(official.index))
-        high_ref = grid["high"].rolling(3, center=True, min_periods=1).max().reindex(ours.index)
-        low_ref = grid["low"].rolling(3, center=True, min_periods=1).min().reindex(ours.index)
-        bad_high = ours["high"] > high_ref * (1 + MAX_PRICE_EXCESS)
-        bad_low = ours["low"] < low_ref * (1 - MAX_PRICE_EXCESS)
-        errors = [f"{label} : {bad.sum()} minutes, ex. {list(ours.index[bad.values][:3])}"
-                  for label, bad in (("high au-dessus des voisines officielles", bad_high),
-                                     ("low en dessous des voisines officielles", bad_low)) if bad.any()]
-        assert not errors, f"{name}\n" + "\n".join(errors)
-
-    def test_no_volume_drift(self, perp_1s_vs_1m):
-        """
-        L'écart de volume cumulé avec Binance ne dérive jamais (MAX_VOLUME_DRIFT, 0,1 % du mois).
-
-        Pourquoi : on additionne, minute après minute, l'écart entre notre volume et le volume
-        officiel. Un trade rangé dans la minute voisine fait monter cet écart cumulé puis le
-        ramène à zéro dès la minute suivante : c'est inoffensif. Un trade perdu, compté deux
-        fois ou attribué au mauvais sens crée au contraire un écart qui persiste. On vérifie
-        la même chose pour le volume acheteur (taker_buy_base), dont dépend la feature de
-        pression acheteurs / vendeurs.
-
-        C'est ce test qui a révélé les aggTrades en double des 12 et 13/09/2022 (volume
-        exactement doublé). Le seuil de 0,1 % laisse passer les petits écarts persistants des
-        semaines agitées, dus aux trades de liquidation absents des aggTrades (0,07 % en
-        juin 2026).
-        """
-        name, ours, official = perp_1s_vs_1m
-        ours = comparable(ours, official)
-        idx = ours.index.union(official.index)
-        total = official["volume"].sum()
+        s = perp_pair["stats"]
         errors = []
-        for col in ("volume", "taker_buy_base"):
-            diff = ours[col].reindex(idx, fill_value=0) - official[col].reindex(idx, fill_value=0)
-            drift = diff.cumsum().abs()
-            if drift.max() > MAX_VOLUME_DRIFT * total:
-                errors.append(f"{col} : dérive max {drift.max():.3f} BTC ({drift.max() / total:.4%} du volume "
-                              f"du mois, max {MAX_VOLUME_DRIFT:.4%}) le {drift.idxmax()}")
-        assert not errors, f"{name}\n" + "\n".join(errors)
+        if s["compared_share"] < contract.MIN_COMPARED_SHARE:
+            errors.append(f"{s['compared_minutes']} minutes comparées sur {s['official_minutes']} "
+                          f"({s['compared_share']:.2%}, min {contract.MIN_COMPARED_SHARE:.0%})")
+        if s["excluded_official_volume_share"] > contract.MAX_EXCLUDED_VOLUME_SHARE:
+            errors.append(f"volume officiel exclu {s['excluded_official_volume_share']:.3%} "
+                          f"(max {contract.MAX_EXCLUDED_VOLUME_SHARE:.2%})")
+        assert_no_errors(perp_pair["name"], errors)
 
-    def test_volume_deficit(self, perp_1s_vs_1m):
+    def test_no_missing_minutes(self, perp_pair):
         """
-        Le volume du mois concorde avec les bougies officielles, à MAX_VOLUME_DEFICIT près (1 %),
-        dans un sens comme dans l'autre : un volume trop faible signale des trades perdus, un
-        volume trop élevé des trades en double.
+        Mêmes minutes avec des trades des deux côtés, après exceptions approuvées.
 
-        Pourquoi : c'est le contrôle d'ensemble. Les déplacements de trades entre minutes se
-        compensent sur le mois ; un écart persistant signifie que des trades manquent. La
-        documentation de Binance indique aussi que les aggTrades excluent les trades du fonds
-        d'assurance et de l'ADL : s'ils comptaient dans les bougies officielles, ils
-        apparaîtraient ici, d'où une petite tolérance.
-
-        On mesure le volume plutôt que la part de minutes identiques : un seul trade déplacé
-        suffit à rendre deux minutes différentes, et plus le marché est actif, plus il y a de
-        minutes concernées, même si le volume en jeu reste négligeable. Le message d'erreur
-        affiche aussi la part de minutes différentes par colonne, à titre d'information.
+        Une minute officielle absente chez nous signifie des trades perdus ; des blocs de
+        1 440 minutes indiquent un fichier mensuel incomplet (download_binance.py le répare
+        avec les fichiers journaliers). Une minute à nous absente de l'officiel signifie
+        une référence incomplète : elle n'est plus un simple avertissement, elle doit être
+        examinée et approuvée (`python diagnose_perp.py --register`, puis approve.py).
         """
-        name, ours, official = perp_1s_vs_1m
-        common = ours.index.intersection(official.index)
-        a, b = ours.loc[common], official.loc[common]
-        deficit = abs(1 - a["volume"].sum() / b["volume"].sum())
-        detail = ", ".join(
-            f"{c} {1 - np.isclose(a[c], b[c], rtol=1e-9, atol=1e-9).mean():.2%}"
-            for c in ("open", "high", "low", "close", "volume")
-        )
-        assert deficit <= MAX_VOLUME_DEFICIT, (
-            f"{name} : écart de volume {deficit:.3%} (max {MAX_VOLUME_DEFICIT:.2%}), "
-            f"nous {a['volume'].sum():.1f} BTC contre {b['volume'].sum():.1f} chez Binance\n"
-            f"minutes différentes par colonne : {detail}"
-        )
+        missing, extra = qc.missing_minutes(perp_pair["ours"], perp_pair["official"])
+        errors = []
+        if len(missing):
+            days = pd.Series(missing.floor("D")).value_counts()
+            full = [f"{d:%Y-%m-%d}" for d, n in days.items() if n >= 1440]
+            errors.append(f"{len(missing)} minute(s) officielle(s) absente(s) de nos données, ex. "
+                          f"{list(missing[:3])} ; journées entières : {full or 'aucune'}")
+        if len(extra):
+            errors.append(f"{len(extra)} minute(s) absente(s) des bougies officielles, ex. {list(extra[:3])}")
+        assert_no_errors(perp_pair["name"], errors)
+
+    def test_prices_match_neighbours(self, perp_pair):
+        """
+        Extrêmes cohérents avec les minutes officielles EXACTES t - 1, t, t + 1, à
+        MAX_PRICE_EXCESS près (0,05 %), dans les deux sens : ni extrême inventé (high trop
+        haut, low trop bas), ni mèche disparue (extrême officiel absent de nos données).
+
+        Pourquoi : les simulations de stop-loss du backtest se déclenchent sur les extrêmes.
+        Une mèche perdue rend le backtest optimiste ; un extrême inventé déclenche des
+        stops fictifs.
+        """
+        errors = qc.price_errors(perp_pair["ours"], perp_pair["official"], MAX_PRICE_EXCESS, perp_pair["ours_full"])
+        assert_no_errors(perp_pair["name"], errors)
+
+    def test_close_matches(self, perp_pair):
+        """
+        Le close de chaque minute est identique à l'officiel, sauf pour au plus
+        MAX_CLOSE_MISMATCH (0,5 %) des minutes.
+
+        Pourquoi : l'égalité des close a été constatée sur 100 % des minutes des mois
+        diagnostiqués ; elle garantit que le dernier trade de chaque minute est bien le
+        bon. L'open n'est PAS contrôlé : il diffère légitimement quand un trade de début de
+        minute est rangé dans la minute précédente.
+        """
+        share = qc.close_mismatch_share(perp_pair["ours"], perp_pair["official"])
+        assert share <= MAX_CLOSE_MISMATCH, (
+            f"{perp_pair['name']} : close différent sur {share:.3%} des minutes (max {MAX_CLOSE_MISMATCH:.2%})")
+
+    def test_no_volume_drift(self, perp_pair):
+        """
+        L'écart de volume cumulé (volume et volume acheteur) ne dépasse jamais
+        MAX_VOLUME_DRIFT (0,1 %) du volume du mois.
+
+        Un trade rangé dans la minute voisine se compense aussitôt ; un trade perdu, compté
+        deux fois ou au mauvais sens crée un écart qui persiste. C'est ce test qui a révélé
+        les aggTrades en double de septembre 2022. Portée : une borne d'amplitude sur le
+        mois ; les erreurs locales sont contrôlées par test_local_volumes.
+        """
+        errors = qc.drift_errors(perp_pair["ours"], perp_pair["official"], MAX_VOLUME_DRIFT)
+        assert_no_errors(perp_pair["name"], errors)
+
+    def test_local_volumes(self, perp_pair):
+        """
+        Volumes (et volume acheteur) concordants par JOUR (MAX_DAY_VOLUME_GAP, 0,5 %) et par
+        HEURE (MAX_HOUR_VOLUME_GAP, 5 %, ou HOUR_VOLUME_FLOOR BTC si c'est plus grand).
+
+        Pourquoi : une heure amputée de 30 % ne pèse que 0,04 % d'un mois et passe la
+        dérive mensuelle. Le plancher horaire en BTC absorbe les trades déplacés à la
+        frontière d'une heure (jusqu'à 60 BTC observés).
+        """
+        errors = qc.local_volume_errors(perp_pair["ours"], perp_pair["official"],
+                                        MAX_DAY_VOLUME_GAP, MAX_HOUR_VOLUME_GAP, HOUR_VOLUME_FLOOR)
+        assert_no_errors(perp_pair["name"], errors)
+
+    def test_month_volume(self, perp_pair):
+        """
+        Le volume total des MINUTES COMMUNES concorde à MAX_VOLUME_DEFICIT près (1 %), dans
+        les deux sens : trop faible = trades perdus, trop élevé = trades en double. Les
+        minutes présentes d'un seul côté sont traitées par test_no_missing_minutes.
+        """
+        gap = qc.month_volume_gap(perp_pair["ours"], perp_pair["official"])
+        assert gap <= MAX_VOLUME_DEFICIT, f"{perp_pair['name']} : écart de volume {gap:.3%} (max {MAX_VOLUME_DEFICIT:.2%})"
 
 
 # =========================================================================== funding
@@ -850,76 +894,63 @@ class TestFunding:
     """Le funding rate est un coût direct des positions à levier : il doit être fiable."""
 
     @pytest.mark.structure
-    def test_not_empty(self, funding):
+    def test_schema(self, funding):
         """
-        Le fichier contient au moins un paiement.
-
-        Pourquoi : avec 3 paiements par jour, un mois en compte environ 90. Un fichier
-        vide indique un téléchargement raté, et le backtest sous-estimerait le coût de
-        détention des positions.
-        """
-        path, df = funding
-        assert len(df) > 0, f"{path.name} est vide"
-
-    @pytest.mark.structure
-    def test_no_nan(self, funding):
-        """
-        Aucune valeur manquante.
+        Colonnes attendues, calc_time en datetime UTC, valeurs finies, intervalle positif.
 
         Pourquoi : un taux manquant serait probablement traité comme 0 par le backtest,
         c'est-à-dire un paiement gratuit qui n'a pas existé.
         """
-        _, df = funding
-        assert not df.isna().any().any()
+        path, df = funding
+        errors = []
+        if list(df.columns) != DATASETS["futures_funding"]["columns"]:
+            errors.append(f"colonnes inattendues : {list(df.columns)}")
+        if not pd.api.types.is_datetime64_any_dtype(df["calc_time"]) or str(df["calc_time"].dt.tz) != "UTC":
+            errors.append("calc_time n'est pas un datetime UTC")
+        errors += qc.finite_errors(df, ["funding_interval_hours", "last_funding_rate"])
+        if (df["funding_interval_hours"] <= 0).any():
+            errors.append("intervalle déclaré nul ou négatif")
+        assert_no_errors(path.name, errors)
 
     @pytest.mark.chronologie
     def test_no_duplicates_and_sorted(self, funding):
-        """
-        Chaque paiement n'apparaît qu'une fois, dans l'ordre chronologique.
-
-        Pourquoi : un paiement en double serait facturé deux fois dans le backtest, et
-        des paiements mal ordonnés seraient attribués aux mauvaises positions.
-        """
+        """Chaque paiement n'apparaît qu'une fois, dans l'ordre chronologique."""
         _, df = funding
         assert not df["calc_time"].duplicated().any()
         assert df["calc_time"].is_monotonic_increasing
 
     @pytest.mark.chronologie
     def test_timestamps_in_file_month(self, funding):
-        """
-        Tous les paiements appartiennent au mois du nom de fichier.
-
-        Pourquoi : même raison que pour les klines, et détection des erreurs d'unité
-        de timestamp.
-        """
+        """Tous les paiements appartiennent au mois du nom de fichier."""
         path, df = funding
-        start, end = utc(month_of(path)), utc(next_month(month_of(path)))
+        start, end = month_range(path)
         assert df["calc_time"].between(start, end, inclusive="left").all()
 
     @pytest.mark.completude
-    def test_regular_interval(self, funding):
+    def test_schedule(self, funding):
         """
-        L'écart entre deux paiements ne dépasse pas l'intervalle déclaré (8 h pour BTCUSDT).
+        Les paiements sont EXACTEMENT les échéances attendues du mois : un paiement à chaque
+        multiple de l'intervalle déclaré (8 h pour BTCUSDT) depuis le début du mois.
 
-        Pourquoi : un écart plus grand signifie un paiement manquant. Le backtest ferait
-        alors comme si une position tenue à ce moment-là n'avait rien payé ni reçu.
+        Pourquoi : un paiement manquant (au début, à la fin ou au milieu du mois) ferait
+        comme si une position tenue à ce moment-là n'avait rien payé ; un paiement en trop
+        la ferait payer deux fois. Comme chaque mois commence à 00:00 et est couvert jusqu'à
+        sa fin, la continuité entre deux mois est garantie. Un fichier réduit à une seule
+        ligne échoue.
         """
-        _, df = funding
-        gaps = df["calc_time"].dt.round("min").diff().dropna()
-        allowed = pd.to_timedelta(df["funding_interval_hours"].iloc[1:].values, unit="h")
-        bad = gaps.values > allowed
-        assert not bad.any(), f"{bad.sum()} écarts anormaux entre paiements de funding"
+        path, df = funding
+        start, end = month_range(path)
+        assert_no_errors(path.name, qc.funding_errors(df, start, end))
 
     @pytest.mark.coherence
-    def test_rate_bounds(self, funding):
+    def test_rate_magnitude(self, funding):
         """
-        Le taux reste dans des bornes réalistes (moins de 3 % par paiement en valeur absolue).
+        |taux| < MAX_FUNDING_ABS (3 %) sur chaque paiement, et médiane de |taux| <=
+        MAX_FUNDING_MEDIAN (0,1 %) sur le mois.
 
-        Pourquoi : un taux typique est de l'ordre de 0,01 %. Binance plafonne le funding,
-        et même dans les phases les plus extrêmes il reste bien en dessous de 3 %. Une
-        valeur plus grande est presque sûrement une erreur d'unité (pourcentage lu comme
-        fraction), qui ferait exploser le coût simulé des positions.
+        Pourquoi : un taux typique est de l'ordre de 0,01 %. La borne maximale seule
+        laisserait passer une erreur d'unité d'un facteur 100 (0,01 % lu comme 1 %) ; la
+        médiane l'attrape.
         """
-        _, df = funding
-        r = df["last_funding_rate"].abs()
-        assert (r < 0.03).all(), f"funding rate aberrant : max {r.max():.4%}"
+        path, df = funding
+        assert_no_errors(path.name, qc.funding_rate_errors(df, MAX_FUNDING_ABS, MAX_FUNDING_MEDIAN))

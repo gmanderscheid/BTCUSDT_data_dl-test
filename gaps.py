@@ -1,42 +1,45 @@
 """
-Détection et registre des trous (secondes manquantes) dans les klines 1s
-(spot_klines_1s et futures_klines_1s).
+Détection des trous (secondes manquantes) dans les bougies 1 s, et registres d'exceptions.
 
 Pourquoi ce module existe
 -------------------------
 Binance ne publie pas de bougie pour une seconde où il ne s'est échangé aucun bitcoin.
-Les klines 1s ont donc des « trous » de deux natures très différentes :
+Les bougies 1 s ont donc des « trous » qu'il faut traiter différemment selon leur durée :
 
-- Trous COURTS (quelques secondes) : le marché était ouvert mais personne n'a traité
-  pendant ce laps de temps. Le prix n'a pas bougé : on peut sans risque reporter le
-  dernier prix et mettre le volume à 0.
+- Trous COURTS (<= SHORT_GAP_MAX_SECONDS, 60 s par défaut) : règle de traitement retenue,
+  reporter le dernier prix et mettre le volume à 0.
+- Trous LONGS : la série doit être COUPÉE. Aucune fenêtre de features ni aucune variable
+  cible ne doit traverser le trou, sinon le modèle apprend sur une réalité inventée.
 
-- Trous LONGS (minutes, heures) : l'exchange était fermé (maintenance programmée, panne,
-  incident technique). Le marché n'existait pas. Reporter le prix sur 3 heures ferait
-  croire au modèle à un marché parfaitement immobile, ce qui n'arrive jamais. Il faut
-  au contraire COUPER la série : aucune fenêtre de features ni aucune variable cible ne
-  doit traverser ce trou, sinon le modèle apprend sur une réalité inventée.
+Le seuil de 60 s décrit une DURÉE : il ne démontre ni qu'un trou long est une maintenance,
+ni qu'un trou court correspond à zéro transaction. C'est une règle de traitement, et la
+cause de chaque trou long doit être examinée.
 
-Le seuil entre les deux est SHORT_GAP_MAX_SECONDS (60 s par défaut).
+Les trous sont calculés fichier par fichier, puis FUSIONNÉS aux changements de mois : un
+trou de 90 s coupé par minuit en 40 s + 50 s est bien un trou long (dataset_gaps).
 
-Le registre des trous longs
----------------------------
-Tous les trous longs sont listés dans data/known_gaps.csv (colonnes : dataset, start,
-end, duration_s, reason). Ce fichier a deux usages :
+Les registres : détection ≠ approbation
+---------------------------------------
+Deux registres versionnés recensent les exceptions acceptées :
 
-1. Pour les tests : un trou long présent dans le registre est considéré comme connu et
-   accepté. Un trou long ABSENT du registre fait échouer les tests, car il peut s'agir
-   d'un téléchargement raté plutôt que d'une vraie fermeture de l'exchange.
-2. Pour la construction des jeux de données : c'est la liste des endroits où il faut
-   couper les séries temporelles.
+- data/known_gaps.csv (trous longs), rempli par `python gaps.py` ;
+- data/known_minute_mismatches.csv (minutes du perpétuel irréparables ou non fiables),
+  rempli par `python diagnose_perp.py --register`.
+
+Chaque entrée a un statut :
+- "candidate" : détectée automatiquement, PAS ENCORE EXAMINÉE. Les tests échouent tant
+  qu'une entrée reste candidate : l'inscription ne vaut pas acceptation.
+- "approved"  : examinée et acceptée, avec une raison obligatoire (colonne `reason`).
+
+L'approbation se fait avec `python approve.py` (ou en éditant le CSV). Les tests
+échouent aussi sur une entrée approuvée qui ne correspond plus aux données (exception
+obsolète). Les registres servent enfin à construire le masque des features : ce sont
+les endroits où couper les séries.
 
 Usage
 -----
-    python gaps.py            # (re)construit le registre à partir des fichiers téléchargés
+    python gaps.py            # (re)construit le registre des trous longs
     python gaps.py --summary  # affiche seulement le résumé, sans écrire
-
-La colonne `reason` est à remplir à la main (ex. « maintenance Binance ») : elle est
-conservée quand on régénère le registre.
 """
 from __future__ import annotations
 
@@ -44,6 +47,7 @@ import argparse
 import os
 import re
 from datetime import date, timedelta
+from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
@@ -56,8 +60,12 @@ SECOND_DATASETS = ["spot_klines_1s", "futures_klines_1s"]
 SHORT_GAP_MAX_SECONDS = int(os.environ.get("SHORT_GAP_MAX_SECONDS", "60"))
 
 FILE_RE = re.compile(r"_(\d{4})-(\d{2})\.parquet$")
-GAP_COLUMNS = ["dataset", "start", "end", "duration_s", "reason"]
 ONE_SECOND = pd.Timedelta(seconds=1)
+STATUSES = ("candidate", "approved")
+
+GAP_COLUMNS = ["dataset", "start", "end", "duration_s", "status", "reason"]
+MISMATCH_SIDES = ("absente_chez_nous", "absente_chez_binance", "zone_invalide")
+MISMATCH_COLUMNS = ["side", "minute", "official_volume", "status", "reason"]
 
 
 def data_dir() -> Path:
@@ -66,8 +74,24 @@ def data_dir() -> Path:
 
 
 def known_gaps_path() -> Path:
-    """Emplacement du registre : à côté du dossier raw/, sauf si KNOWN_GAPS_FILE est défini."""
+    """Registre des trous longs : à côté du dossier raw/, sauf si KNOWN_GAPS_FILE est défini."""
     return Path(os.environ.get("KNOWN_GAPS_FILE", data_dir().parent / "known_gaps.csv"))
+
+
+def known_mismatches_path() -> Path:
+    """
+    Registre des minutes du perpétuel qui diffèrent de façon irréparable des bougies 1 min
+    officielles (data/known_minute_mismatches.csv).
+
+    side = "absente_chez_nous"    : Binance a une bougie officielle, mais aucun aggTrade,
+                                    même dans le fichier journalier ;
+    side = "absente_chez_binance" : nous avons des aggTrades, mais le fichier officiel 1 min
+                                    n'a pas de bougie, même dans le fichier journalier ;
+    side = "zone_invalide"        : minute ajoutée À LA MAIN, présente des deux côtés mais
+                                    jugée non fiable (incident chez Binance). Exclue des
+                                    comparaisons et de la construction des features.
+    """
+    return Path(os.environ.get("KNOWN_MISMATCHES_FILE", data_dir().parent / "known_minute_mismatches.csv"))
 
 
 # --------------------------------------------------------------------------- dates
@@ -97,10 +121,10 @@ def expected_range(path: Path, df: pd.DataFrame, is_first_file: bool,
     Intervalle [start, end[ dans lequel on attend une bougie par seconde.
 
     - Cas général : le mois complet.
-    - Premier fichier du dataset : Binance a pu commencer la publication en cours de mois,
-      on démarre donc au premier jour réellement présent.
-    - Mois en cours : les données s'arrêtent au dernier jour téléchargé (hier au mieux),
-      on s'arrête donc à la fin de ce jour-là.
+    - Premier fichier du dataset : on démarre au premier jour réellement présent. Le
+      contrat de couverture (data_contract.py) vérifie séparément que ce premier mois est
+      bien celui attendu.
+    - Mois en cours : on s'arrête à la fin du dernier jour téléchargé.
     """
     today = today or date.today()
     month = month_of(path)
@@ -110,39 +134,6 @@ def expected_range(path: Path, df: pd.DataFrame, is_first_file: bool,
     if month == today.replace(day=1):
         end = min(end, df["open_time"].max().floor("D") + pd.Timedelta(days=1))
     return start, end
-
-
-# --------------------------------------------------------------------------- minutes irréparables du perpétuel
-
-MISMATCH_COLUMNS = ["side", "minute", "official_volume", "reason"]
-
-
-def known_mismatches_path() -> Path:
-    """
-    Registre des minutes du perpétuel qui diffèrent de façon IRRÉPARABLE des bougies 1 min
-    officielles (data/known_minute_mismatches.csv), rempli par `python diagnose_perp.py --register`.
-
-    side = "absente_chez_nous"    : Binance a une bougie officielle, mais aucun aggTrade,
-                                    même dans le fichier journalier (probablement une minute
-                                    où seuls des trades du fonds d'assurance / ADL ont eu lieu) ;
-    side = "absente_chez_binance" : nous avons des aggTrades, mais le fichier officiel 1 min
-                                    n'a pas de bougie, même dans le fichier journalier ;
-    side = "zone_invalide"        : minute ajoutée À LA MAIN, présente des deux côtés mais
-                                    jugée non fiable (incident chez Binance, horodatages
-                                    perturbés). Exclue des comparaisons, et à exclure aussi de
-                                    la construction des features. Conservée par --register.
-    """
-    return Path(os.environ.get("KNOWN_MISMATCHES_FILE", data_dir().parent / "known_minute_mismatches.csv"))
-
-
-def load_known_mismatches(path: Path | None = None) -> pd.DataFrame:
-    path = path or known_mismatches_path()
-    if not path.exists():
-        return pd.DataFrame(columns=MISMATCH_COLUMNS)
-    df = pd.read_csv(path, dtype={"reason": "string"})
-    df["minute"] = pd.to_datetime(df["minute"], utc=True)
-    df["reason"] = df["reason"].fillna("")
-    return df
 
 
 # --------------------------------------------------------------------------- détection
@@ -171,51 +162,121 @@ def find_gaps(timestamps: pd.Series, start: pd.Timestamp, end: pd.Timestamp) -> 
     return gaps.reset_index(drop=True)
 
 
+def merge_adjacent_gaps(gaps: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fusionne les trous qui se touchent (fin + 1 s == début du suivant).
+
+    Cas typique : un trou coupé par un changement de mois, qui apparaît comme deux trous
+    distincts (fin du fichier du mois M, début du fichier du mois M+1).
+    """
+    if gaps.empty:
+        return gaps
+    g = gaps.sort_values("start").reset_index(drop=True)
+    new_group = g["start"] != g["end"].shift() + ONE_SECOND
+    grp = new_group.cumsum()
+    out = g.groupby(grp).agg(start=("start", "first"), end=("end", "last"))
+    out["duration_s"] = ((out["end"] - out["start"]) // ONE_SECOND + 1).astype("int64")
+    return out.reset_index(drop=True)
+
+
+@lru_cache(maxsize=None)
+def dataset_gaps(dataset: str, root: str | None = None, today: date | None = None) -> pd.DataFrame:
+    """
+    Tous les trous d'un dataset 1 s, fusionnés aux changements de mois.
+
+    Ne lit que la colonne open_time de chaque fichier. Mis en cache : les tests appellent
+    cette fonction une fois par dataset, puis filtrent par fichier.
+    """
+    files = files_of(dataset, Path(root) if root else None)
+    parts = []
+    for i, path in enumerate(files):
+        df = pd.read_parquet(path, columns=["open_time"])
+        start, end = expected_range(path, df, is_first_file=(i == 0), today=today)
+        parts.append(find_gaps(df["open_time"], start, end))
+    if not parts:
+        return pd.DataFrame(columns=["start", "end", "duration_s"])
+    return merge_adjacent_gaps(pd.concat(parts, ignore_index=True))
+
+
 def split_gaps(gaps: pd.DataFrame, threshold: int = SHORT_GAP_MAX_SECONDS) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Sépare les trous courts (<= threshold secondes) des trous longs."""
     long_mask = gaps["duration_s"] > threshold
     return gaps[~long_mask], gaps[long_mask]
 
 
-# --------------------------------------------------------------------------- registre
+def gaps_overlapping(gaps: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Trous qui chevauchent [start, end[ (un trou à cheval sur deux mois apparaît dans les deux)."""
+    return gaps[(gaps["start"] < end) & (gaps["end"] >= start)]
+
+
+# --------------------------------------------------------------------------- registres
+
+def _normalize_review(df: pd.DataFrame) -> pd.DataFrame:
+    """Statut et raison : une entrée sans statut (ancien format) est une candidate."""
+    if "status" not in df.columns:
+        df["status"] = "candidate"
+    df["status"] = df["status"].fillna("candidate").astype(str).str.strip()
+    if "reason" not in df.columns:
+        df["reason"] = ""
+    df["reason"] = df["reason"].fillna("").astype(str)
+    return df
+
 
 def load_known_gaps(path: Path | None = None) -> pd.DataFrame:
     path = path or known_gaps_path()
     if not path.exists():
         return pd.DataFrame(columns=GAP_COLUMNS)
-    df = pd.read_csv(path, dtype={"reason": "string"})
+    df = pd.read_csv(path, dtype={"reason": "string", "status": "string"})
     df["start"] = pd.to_datetime(df["start"], utc=True)
     df["end"] = pd.to_datetime(df["end"], utc=True)
-    df["reason"] = df["reason"].fillna("")
-    return df
+    return _normalize_review(df)[GAP_COLUMNS]
 
 
-def scan_long_gaps(dataset: str) -> pd.DataFrame:
-    """Parcourt tous les fichiers du dataset et renvoie l'ensemble des trous longs."""
-    files = files_of(dataset)
-    found = []
-    for i, path in enumerate(files):
-        df = pd.read_parquet(path, columns=["open_time"])
-        start, end = expected_range(path, df, is_first_file=(i == 0))
-        _, long_gaps = split_gaps(find_gaps(df["open_time"], start, end))
-        found.append(long_gaps.assign(dataset=dataset))
-    if not found:
-        return pd.DataFrame(columns=GAP_COLUMNS)
-    return pd.concat(found, ignore_index=True)
+def load_known_mismatches(path: Path | None = None) -> pd.DataFrame:
+    path = path or known_mismatches_path()
+    if not path.exists():
+        return pd.DataFrame(columns=MISMATCH_COLUMNS)
+    df = pd.read_csv(path, dtype={"reason": "string", "status": "string"})
+    df["minute"] = pd.to_datetime(df["minute"], utc=True)
+    return _normalize_review(df)[MISMATCH_COLUMNS]
 
 
-def build_registry(write: bool = True) -> pd.DataFrame:
-    """Régénère le registre (tous les datasets 1 s) en conservant les `reason` saisies à la main."""
-    scanned = pd.concat([scan_long_gaps(d) for d in SECOND_DATASETS], ignore_index=True)
+def approved(df: pd.DataFrame) -> pd.DataFrame:
+    """Entrées examinées et acceptées, avec une raison."""
+    return df[(df["status"] == "approved") & (df["reason"].str.strip() != "")]
+
+
+def detected_long_gaps() -> pd.DataFrame:
+    parts = [split_gaps(dataset_gaps(d, str(data_dir())))[1].assign(dataset=d) for d in SECOND_DATASETS]
+    parts = [p for p in parts if not p.empty]
+    if not parts:
+        return pd.DataFrame(columns=["dataset", "start", "end", "duration_s"])
+    return pd.concat(parts, ignore_index=True)
+
+
+def build_registry(write: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Régénère le registre des trous longs.
+
+    Un trou déjà présent garde son statut et sa raison. Un nouveau trou est inscrit comme
+    « candidate » : il faudra l'examiner puis l'approuver. Les entrées qui ne correspondent
+    plus à aucun trou détecté sont retirées et renvoyées pour affichage.
+    """
+    dataset_gaps.cache_clear()
+    scanned = detected_long_gaps()
     known = load_known_gaps()
-    reasons = {(r.dataset, r.start, r.end): r.reason for r in known.itertuples()}
-    scanned["reason"] = [reasons.get((r.dataset, r.start, r.end), "") for r in scanned.itertuples()]
+    review = {(r.dataset, r.start, r.end): (r.status, r.reason) for r in known.itertuples()}
+    scanned["status"] = [review.get((r.dataset, r.start, r.end), ("candidate", ""))[0] for r in scanned.itertuples()]
+    scanned["reason"] = [review.get((r.dataset, r.start, r.end), ("candidate", ""))[1] for r in scanned.itertuples()]
     scanned = scanned[GAP_COLUMNS].sort_values(["dataset", "start"]).reset_index(drop=True)
+
+    keys = set(zip(scanned["dataset"], scanned["start"], scanned["end"]))
+    removed = known[[(r.dataset, r.start, r.end) not in keys for r in known.itertuples()]]
     if write:
         path = known_gaps_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         scanned.to_csv(path, index=False)
-    return scanned
+    return scanned, removed
 
 
 def main() -> None:
@@ -223,16 +284,23 @@ def main() -> None:
     parser.add_argument("--summary", action="store_true", help="affiche sans écrire le registre")
     args = parser.parse_args()
 
-    reg = build_registry(write=not args.summary)
+    reg, removed = build_registry(write=not args.summary)
     if reg.empty:
         print("Aucun trou long détecté.")
-        return
-    total_h = reg["duration_s"].sum() / 3600
-    print(f"{len(reg)} trous longs (> {SHORT_GAP_MAX_SECONDS} s), {total_h:.1f} h au total")
-    for dataset, g in reg.groupby("dataset"):
-        print(f"  {dataset} : {len(g)} trous, {g['duration_s'].sum() / 3600:.1f} h")
-    print()
-    print(reg.sort_values("duration_s", ascending=False).head(20).to_string(index=False))
+    else:
+        total_h = reg["duration_s"].sum() / 3600
+        print(f"{len(reg)} trous longs (> {SHORT_GAP_MAX_SECONDS} s), {total_h:.1f} h au total")
+        for dataset, g in reg.groupby("dataset"):
+            print(f"  {dataset} : {len(g)} trous, {g['duration_s'].sum() / 3600:.1f} h")
+        cand = reg[reg["status"] != "approved"]
+        print(f"\n{len(cand)} trou(s) à examiner (statut candidate) :")
+        if not cand.empty:
+            print(cand.sort_values("duration_s", ascending=False).head(30).to_string(index=False))
+            print("\nUne journée entière (86 400 s) n'est jamais une maintenance : vérifie d'abord "
+                  "le téléchargement. Approuve ensuite avec : python approve.py gaps <date> \"<raison>\"")
+    if not removed.empty:
+        print(f"\n{len(removed)} entrée(s) retirée(s) du registre car plus détectée(s) :")
+        print(removed.to_string(index=False))
     if not args.summary:
         print(f"\nRegistre écrit dans {known_gaps_path()}")
 
